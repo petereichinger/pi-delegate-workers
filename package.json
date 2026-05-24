@@ -1,0 +1,15 @@
+{
+  "name": "pi-delegate-workers",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pi extension that delegates read-only tasks to parallel pi RPC workers.",
+  "keywords": ["pi-package"],
+  "type": "module",
+  "pi": {
+    "extensions": ["./extensions/index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
