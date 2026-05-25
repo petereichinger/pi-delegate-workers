@@ -10,6 +10,7 @@ It launches separate `pi --mode rpc` worker processes, runs read-only tasks in p
 - `delegate_tasks(tasks)` custom tool for model-driven delegation
 - worker status widget + footer status
 - per-worker synthesis pass before returning results to the parent session
+- `/delegate` always sends the compact worker summaries back into the main chat for a final synthesis
 - read-only workers by default (`read,grep,find,ls`)
 
 ## Load it once
@@ -30,7 +31,7 @@ pi install /home/pete/Projects/code/pi-delegate-workers
 /delegate inspect auth flow | find flaky test causes | review migration safety
 ```
 
-When the workers finish, the extension returns compact per-worker summaries to the main session so parent-context usage stays smaller.
+When the workers finish, the extension returns compact per-worker summaries to the main session and asks the parent agent to synthesize them, so parent-context usage stays smaller.
 
 ## Environment knobs
 

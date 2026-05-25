@@ -256,7 +256,7 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("delegate", {
-    description: "Delegate parallel read-only tasks: /delegate task A | task B | task C",
+    description: "Delegate parallel read-only tasks and synthesize the worker summaries in chat",
     handler: async (args, ctx) => {
       const tasks = parseTasks(args);
       const maxWorkers = getMaxWorkers();
@@ -276,47 +276,18 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
         tasks.map((task) => runTask(ctx, workers, task, makeWorkerId(), {}))
       );
       const combined = formatResults(results);
+      const payload = [
+        {
+          type: "text",
+          text: "I ran delegated workers. Please synthesize their compact per-worker summaries into one answer for me.",
+        },
+        { type: "text", text: combined },
+      ];
 
-      if (!ctx.hasUI) {
-        if (ctx.isIdle()) {
-          pi.sendUserMessage([
-            { type: "text", text: "I ran delegated workers. Please synthesize their results." },
-            { type: "text", text: combined },
-          ]);
-        } else {
-          pi.sendUserMessage(
-            [
-              { type: "text", text: "I ran delegated workers. Please synthesize their results." },
-              { type: "text", text: combined },
-            ],
-            { deliverAs: "followUp" }
-          );
-        }
-        return;
-      }
-
-      const choice = await ctx.ui.select("Delegation complete", [
-        "Summarize in chat",
-        "Open raw results",
-        "Both",
-        "Do nothing",
-      ]);
-
-      if (choice === "Open raw results" || choice === "Both") {
-        await ctx.ui.editor("Delegation results", combined);
-      }
-
-      if (choice === "Summarize in chat" || choice === "Both") {
-        const payload = [
-          { type: "text", text: "I ran delegated workers. Please synthesize their results for me." },
-          { type: "text", text: combined },
-        ];
-
-        if (ctx.isIdle()) {
-          pi.sendUserMessage(payload);
-        } else {
-          pi.sendUserMessage(payload, { deliverAs: "followUp" });
-        }
+      if (ctx.isIdle()) {
+        pi.sendUserMessage(payload);
+      } else {
+        pi.sendUserMessage(payload, { deliverAs: "followUp" });
       }
     },
   });
