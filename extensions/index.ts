@@ -1,6 +1,13 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { createRpcWorker, type RpcEvent, type RpcWorker } from "./rpc-worker.ts";
+import {
+  createRpcWorker,
+  type RpcEvent,
+  type RpcWorker,
+} from "./rpc-worker.ts";
 
 type WorkerState = {
   id: string;
@@ -9,6 +16,24 @@ type WorkerState = {
   output: string;
   worker: RpcWorker;
 };
+
+type WorkerUiState = "starting" | "working" | "synthesizing" | "done" | "error";
+
+const WORKER_UI_STATES: WorkerUiState[] = [
+  "starting",
+  "working",
+  "synthesizing",
+  "done",
+  "error",
+];
+
+const WORKER_STATE_STYLES = {
+  starting: { icon: "", fg: "muted", bg: "selectedBg" },
+  working: { icon: "", fg: "accent", bg: "toolPendingBg" },
+  synthesizing: { icon: "", fg: "warning", bg: "toolPendingBg" },
+  done: { icon: "", fg: "success", bg: "toolSuccessBg" },
+  error: { icon: "", fg: "error", bg: "toolErrorBg" },
+} as const;
 
 type DelegatedResult = {
   id: string;
@@ -35,7 +60,9 @@ function getWorkerTools(): string[] {
 
 function getMaxWorkers(): number {
   const raw = Number(process.env.PI_DELEGATE_MAX_WORKERS);
-  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_MAX_WORKERS;
+  return Number.isFinite(raw) && raw > 0
+    ? Math.floor(raw)
+    : DEFAULT_MAX_WORKERS;
 }
 
 function parseTasks(text: string): string[] {
@@ -100,20 +127,44 @@ function formatResults(results: DelegatedResult[]): string {
     .join("\n\n---\n\n");
 }
 
+function getWorkerUiState(status: string): WorkerUiState {
+  if (status === "synthesizing") return "synthesizing";
+  if (status === "done") return "done";
+  if (status === "error") return "error";
+  if (status === "starting") return "starting";
+  return "working";
+}
+
 function refreshUi(ctx: ExtensionContext, workers: Map<string, WorkerState>) {
+  ctx.ui.setWidget("delegate-workers", undefined);
+
   if (workers.size === 0) {
     ctx.ui.setStatus("delegate-workers", undefined);
-    ctx.ui.setWidget("delegate-workers", ["delegate: idle"]);
     return;
   }
 
-  const lines = ["delegate workers:"];
+  const counts: Record<WorkerUiState, number> = {
+    starting: 0,
+    working: 0,
+    synthesizing: 0,
+    done: 0,
+    error: 0,
+  };
+
   for (const worker of workers.values()) {
-    lines.push(`[${worker.id}] ${worker.status} :: ${worker.task}`);
+    counts[getWorkerUiState(worker.status)]++;
   }
 
-  ctx.ui.setWidget("delegate-workers", lines);
-  ctx.ui.setStatus("delegate-workers", `${workers.size} active`);
+  const summary = WORKER_UI_STATES
+    .filter((state) => counts[state] > 0)
+    .map((state) => {
+      const style = WORKER_STATE_STYLES[state];
+      const text = ` ${style.icon} ${counts[state]} `;
+      return ctx.ui.theme.bg(style.bg, ctx.ui.theme.fg(style.fg, text));
+    })
+    .join(" ");
+
+  ctx.ui.setStatus("delegate-workers", summary);
 }
 
 async function runTask(
@@ -121,7 +172,7 @@ async function runTask(
   workers: Map<string, WorkerState>,
   task: string,
   id: string,
-  options: { signal?: AbortSignal; sharedContext?: string }
+  options: { signal?: AbortSignal; sharedContext?: string },
 ): Promise<DelegatedResult> {
   const worker = createRpcWorker({ cwd: ctx.cwd, tools: getWorkerTools() });
   const state: WorkerState = {
@@ -164,10 +215,13 @@ async function runTask(
   };
 
   try {
-    const investigation = await worker.prompt(buildWorkerPrompt(task, options.sharedContext), {
-      onEvent,
-      signal: options.signal,
-    });
+    const investigation = await worker.prompt(
+      buildWorkerPrompt(task, options.sharedContext),
+      {
+        onEvent,
+        signal: options.signal,
+      },
+    );
 
     state.status = "synthesizing";
     state.output = "";
@@ -256,7 +310,8 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("delegate", {
-    description: "Delegate parallel read-only tasks and synthesize the worker summaries in chat",
+    description:
+      "Delegate parallel read-only tasks and synthesize the worker summaries in chat",
     handler: async (args, ctx) => {
       const tasks = parseTasks(args);
       const maxWorkers = getMaxWorkers();
@@ -273,7 +328,7 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
 
       ctx.ui.notify(`Launching ${tasks.length} delegate worker(s)...`, "info");
       const results = await Promise.all(
-        tasks.map((task) => runTask(ctx, workers, task, makeWorkerId(), {}))
+        tasks.map((task) => runTask(ctx, workers, task, makeWorkerId(), {})),
       );
       const combined = formatResults(results);
       const payload = [
@@ -295,15 +350,24 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "delegate_tasks",
     label: "Delegate Tasks",
-    description: "Run multiple focused read-only tasks in parallel using pi RPC workers",
-    promptSnippet: "Run a few independent read-only investigation tasks in parallel and return combined findings.",
+    description:
+      "Run multiple focused read-only tasks in parallel using pi RPC workers",
+    promptSnippet:
+      "Run a few independent read-only investigation tasks in parallel and return combined findings.",
     promptGuidelines: [
       "Use delegate_tasks for independent research or code-reading subtasks that can run in parallel.",
       "Use delegate_tasks only for tasks that do not need to modify files.",
     ],
     parameters: Type.Object({
-      tasks: Type.Array(Type.String(), { minItems: 1, maxItems: DEFAULT_MAX_WORKERS }),
-      sharedContext: Type.Optional(Type.String({ description: "Extra context to prepend to each worker task" })),
+      tasks: Type.Array(Type.String(), {
+        minItems: 1,
+        maxItems: DEFAULT_MAX_WORKERS,
+      }),
+      sharedContext: Type.Optional(
+        Type.String({
+          description: "Extra context to prepend to each worker task",
+        }),
+      ),
     }),
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const maxWorkers = getMaxWorkers();
@@ -312,7 +376,12 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
       }
 
       onUpdate?.({
-        content: [{ type: "text", text: `Launching ${params.tasks.length} delegate worker(s)...` }],
+        content: [
+          {
+            type: "text",
+            text: `Launching ${params.tasks.length} delegate worker(s)...`,
+          },
+        ],
       });
 
       const results = await Promise.all(
@@ -320,8 +389,8 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
           runTask(ctx, workers, task, makeWorkerId(), {
             signal,
             sharedContext: params.sharedContext,
-          })
-        )
+          }),
+        ),
       );
 
       const combined = formatResults(results);

@@ -1,0 +1,11 @@
+{
+  "packages": [
+    {
+      "source": "git:github.com/petereichinger/pi-delegate-workers@v0.1.1",
+      "extensions": [],
+      "skills": [],
+      "prompts": [],
+      "themes": []
+    }
+  ]
+}
