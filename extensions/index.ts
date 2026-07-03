@@ -174,7 +174,7 @@ async function runTask(
   id: string,
   options: { signal?: AbortSignal; sharedContext?: string },
 ): Promise<DelegatedResult> {
-  const worker = createRpcWorker({ cwd: ctx.cwd, tools: getWorkerTools() });
+  const worker = createRpcWorker({ cwd: ctx.cwd, tools: getWorkerTools(), ui: ctx.ui, uiPrefix: id });
   const state: WorkerState = {
     id,
     task,

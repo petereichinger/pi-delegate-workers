@@ -11,6 +11,18 @@ export type RpcWorker = {
   dispose(): void;
 };
 
+type RpcUi = {
+  select?: (title: string, options: string[], optionsArg?: any) => Promise<string | undefined>;
+  confirm?: (title: string, message?: string, optionsArg?: any) => Promise<boolean>;
+  input?: (title: string, placeholder?: string, optionsArg?: any) => Promise<string | undefined>;
+  editor?: (title: string, prefill?: string, optionsArg?: any) => Promise<string | undefined>;
+  notify?: (message: string, type?: "info" | "warning" | "error") => void;
+  setStatus?: (key: string, text?: string) => void;
+  setWidget?: (key: string, lines?: string[], optionsArg?: any) => void;
+  setTitle?: (title: string) => void;
+  setEditorText?: (text: string) => void;
+};
+
 type ActivePrompt = {
   id: string;
   text: string;
@@ -48,11 +60,21 @@ function parseJsonl(proc: ChildProcessWithoutNullStreams, onEvent: (event: RpcEv
   });
 }
 
-export function createRpcWorker(options: { cwd: string; tools: string[] }): RpcWorker {
+function splitExtraArgs(value: string | undefined): string[] {
+  if (!value?.trim()) return [];
+  return value.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g)?.map((part) => {
+    if ((part.startsWith('"') && part.endsWith('"')) || (part.startsWith("'") && part.endsWith("'"))) {
+      return part.slice(1, -1);
+    }
+    return part;
+  }) ?? [];
+}
+
+export function createRpcWorker(options: { cwd: string; tools: string[]; ui?: RpcUi; uiPrefix?: string }): RpcWorker {
   const bin = process.env.PI_DELEGATE_PI_BIN || "pi";
   const proc = spawn(
     bin,
-    ["--mode", "rpc", "--no-session", "--tools", options.tools.join(",")],
+    ["--mode", "rpc", "--no-session", "--tools", options.tools.join(","), ...splitExtraArgs(process.env.PI_DELEGATE_EXTRA_ARGS)],
     {
       cwd: options.cwd,
       stdio: ["pipe", "pipe", "pipe"],
@@ -67,7 +89,76 @@ export function createRpcWorker(options: { cwd: string; tools: string[] }): RpcW
     stderr += chunk.toString("utf8");
   });
 
+  const respondToUiRequest = (id: string, response: Record<string, unknown>) => {
+    try {
+      send({ type: "extension_ui_response", id, ...response });
+    } catch {
+      // ignore; the worker may already be gone
+    }
+  };
+
+  const handleUiRequest = async (event: any) => {
+    const ui = options.ui;
+    if (!event.id || !ui) {
+      if (event.id && ["select", "confirm", "input", "editor"].includes(event.method)) {
+        respondToUiRequest(event.id, { cancelled: true });
+      }
+      return;
+    }
+
+    const prefix = options.uiPrefix ? `[${options.uiPrefix}] ` : "[delegate worker] ";
+    try {
+      if (event.method === "select") {
+        const value = await ui.select?.(`${prefix}${event.title ?? "Select"}`, event.options ?? [], { timeout: event.timeout });
+        respondToUiRequest(event.id, value === undefined ? { cancelled: true } : { value });
+        return;
+      }
+      if (event.method === "confirm") {
+        const confirmed = await ui.confirm?.(`${prefix}${event.title ?? "Confirm"}`, event.message, { timeout: event.timeout });
+        respondToUiRequest(event.id, { confirmed: Boolean(confirmed) });
+        return;
+      }
+      if (event.method === "input") {
+        const value = await ui.input?.(`${prefix}${event.title ?? "Input"}`, event.placeholder, { timeout: event.timeout });
+        respondToUiRequest(event.id, value === undefined ? { cancelled: true } : { value });
+        return;
+      }
+      if (event.method === "editor") {
+        const value = await ui.editor?.(`${prefix}${event.title ?? "Edit"}`, event.prefill, { timeout: event.timeout });
+        respondToUiRequest(event.id, value === undefined ? { cancelled: true } : { value });
+        return;
+      }
+      if (event.method === "notify") {
+        ui.notify?.(`${prefix}${event.message ?? ""}`, event.notifyType);
+        return;
+      }
+      if (event.method === "setStatus") {
+        ui.setStatus?.(`delegate-${event.statusKey ?? event.id}`, event.statusText);
+        return;
+      }
+      if (event.method === "setWidget") {
+        ui.setWidget?.(`delegate-${event.widgetKey ?? event.id}`, event.widgetLines, { placement: event.widgetPlacement });
+        return;
+      }
+      if (event.method === "setTitle") {
+        ui.setTitle?.(String(event.title ?? ""));
+        return;
+      }
+      if (event.method === "set_editor_text") {
+        ui.setEditorText?.(String(event.text ?? ""));
+      }
+    } catch {
+      if (["select", "confirm", "input", "editor"].includes(event.method)) {
+        respondToUiRequest(event.id, { cancelled: true });
+      }
+    }
+  };
+
   parseJsonl(proc, (event) => {
+    if (event.type === "extension_ui_request") {
+      void handleUiRequest(event);
+    }
+
     if (!activePrompt) return;
 
     activePrompt.onEvent?.(event);
