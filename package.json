@@ -2,7 +2,7 @@
   "name": "pi-delegate-workers",
   "version": "0.2.0",
   "private": true,
-  "description": "Pi extension that delegates read-only tasks to parallel pi RPC workers.",
+  "description": "Pi extension that delegates configured tasks to parallel pi RPC workers.",
   "keywords": [
     "pi-package"
   ],

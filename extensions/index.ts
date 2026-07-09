@@ -45,7 +45,7 @@ type DelegatedResult = {
   durationMs: number;
 };
 
-const DEFAULT_TOOLS = ["read", "grep", "find", "ls"];
+const DEFAULT_TOOLS = ["read", "write", "edit", "bash"];
 const DEFAULT_MAX_WORKERS = 5;
 
 function getWorkerTools(): string[] {
@@ -79,12 +79,9 @@ function buildWorkerPrompt(task: string, sharedContext?: string): string {
     "Rules:",
     "- stay tightly scoped to the assigned task",
     "- use only the available tools",
-    "- do not modify files",
     "- cite concrete file paths when possible",
     "- gather the evidence you need, then stop; a separate synthesis pass will follow",
-    sharedContext ? "" : undefined,
     sharedContext ? "Shared context:" : undefined,
-    sharedContext,
     "",
     "Assigned task:",
     task,
@@ -155,8 +152,7 @@ function refreshUi(ctx: ExtensionContext, workers: Map<string, WorkerState>) {
     counts[getWorkerUiState(worker.status)]++;
   }
 
-  const summary = WORKER_UI_STATES
-    .filter((state) => counts[state] > 0)
+  const summary = WORKER_UI_STATES.filter((state) => counts[state] > 0)
     .map((state) => {
       const style = WORKER_STATE_STYLES[state];
       const text = ` ${style.icon} ${counts[state]} `;
@@ -174,7 +170,12 @@ async function runTask(
   id: string,
   options: { signal?: AbortSignal; sharedContext?: string },
 ): Promise<DelegatedResult> {
-  const worker = createRpcWorker({ cwd: ctx.cwd, tools: getWorkerTools(), ui: ctx.ui, uiPrefix: id });
+  const worker = createRpcWorker({
+    cwd: ctx.cwd,
+    tools: getWorkerTools(),
+    ui: ctx.ui,
+    uiPrefix: id,
+  });
   const state: WorkerState = {
     id,
     task,
@@ -311,7 +312,7 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
 
   pi.registerCommand("delegate", {
     description:
-      "Delegate parallel read-only tasks and synthesize the worker summaries in chat",
+      "Delegate parallel tasks using configured worker tools and synthesize the worker summaries in chat",
     handler: async (args, ctx) => {
       const tasks = parseTasks(args);
       const maxWorkers = getMaxWorkers();
@@ -351,12 +352,13 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
     name: "delegate_tasks",
     label: "Delegate Tasks",
     description:
-      "Run multiple focused read-only tasks in parallel using pi RPC workers",
+      "Run multiple focused tasks in parallel using pi RPC workers with the configured worker tools",
     promptSnippet:
-      "Run a few independent read-only investigation tasks in parallel and return combined findings.",
+      "Run a few independent tasks in parallel using configured delegate worker tools and return combined findings.",
     promptGuidelines: [
-      "Use delegate_tasks for independent research or code-reading subtasks that can run in parallel.",
-      "Use delegate_tasks only for tasks that do not need to modify files.",
+      "Use delegate_tasks for independent subtasks that can run in parallel.",
+      "Workers use pi's normal tool set by default (read, write, edit, bash), and can be reconfigured via PI_DELEGATE_TOOLS.",
+      "Only delegate tasks that fit the currently configured worker tool allowlist; use PI_DELEGATE_TOOLS=read,grep,find,ls for read-only workers.",
     ],
     parameters: Type.Object({
       tasks: Type.Array(Type.String(), {
