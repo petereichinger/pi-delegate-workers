@@ -1,4 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { existsSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export type RpcEvent = any;
 
@@ -70,11 +73,64 @@ function splitExtraArgs(value: string | undefined): string[] {
   }) ?? [];
 }
 
+function findToolGuardExtensionArg(args: string[]): string | undefined {
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index]!;
+    if ((arg === "-e" || arg === "--extension") && args[index + 1]?.includes("pi-tool-guard")) return args[index + 1];
+    if (arg.startsWith("--extension=") && arg.includes("pi-tool-guard")) return arg.slice("--extension=".length);
+  }
+  return undefined;
+}
+
+function hasToolGuardExtensionArg(args: string[]): boolean {
+  return Boolean(findToolGuardExtensionArg(args));
+}
+
+function hasNoExtensionsArg(args: string[]): boolean {
+  return args.includes("--no-extensions");
+}
+
+function isDisabled(value: string | undefined): boolean {
+  return ["0", "false", "no", "off", "disabled"].includes(value?.trim().toLowerCase() ?? "");
+}
+
+function resolveToolGuardExtension(): string | undefined {
+  const mode = process.env.PI_DELEGATE_TOOL_GUARD?.trim().toLowerCase();
+  if (isDisabled(mode)) return undefined;
+
+  const explicit = process.env.PI_DELEGATE_TOOL_GUARD_EXTENSION?.trim();
+  if (explicit) return explicit;
+
+  const parentCliExtension = findToolGuardExtensionArg(process.argv.slice(2));
+  if (parentCliExtension) return parentCliExtension;
+
+  const extensionDir = dirname(fileURLToPath(import.meta.url));
+  const sibling = resolve(extensionDir, "..", "..", "pi-tool-guard");
+  if (existsSync(resolve(sibling, "package.json"))) return sibling;
+
+  if (["1", "true", "yes", "on", "required"].includes(mode ?? "")) return "pi-tool-guard";
+  return undefined;
+}
+
+function buildWorkerArgs(tools: string[]): string[] {
+  const extraArgs = splitExtraArgs(process.env.PI_DELEGATE_EXTRA_ARGS);
+  const args = ["--mode", "rpc", "--no-session", "--tools", tools.join(",")];
+  const toolGuardExtension = resolveToolGuardExtension();
+  if (toolGuardExtension && !isDisabled(process.env.PI_DELEGATE_TOOL_GUARD_ISOLATE) && !hasNoExtensionsArg(extraArgs)) {
+    args.push("--no-extensions");
+  }
+  if (toolGuardExtension && !hasToolGuardExtensionArg(extraArgs)) {
+    args.push("--extension", toolGuardExtension);
+  }
+  args.push(...extraArgs);
+  return args;
+}
+
 export function createRpcWorker(options: { cwd: string; tools: string[]; ui?: RpcUi; uiPrefix?: string }): RpcWorker {
   const bin = process.env.PI_DELEGATE_PI_BIN || "pi";
   const proc = spawn(
     bin,
-    ["--mode", "rpc", "--no-session", "--tools", options.tools.join(","), ...splitExtraArgs(process.env.PI_DELEGATE_EXTRA_ARGS)],
+    buildWorkerArgs(options.tools),
     {
       cwd: options.cwd,
       stdio: ["pipe", "pipe", "pipe"],
