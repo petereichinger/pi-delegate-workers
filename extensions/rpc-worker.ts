@@ -2,6 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { RpcUiDialogQueue } from "./ui-dialog-queue.ts";
 
 export type RpcEvent = any;
 
@@ -126,7 +127,13 @@ function buildWorkerArgs(tools: string[]): string[] {
   return args;
 }
 
-export function createRpcWorker(options: { cwd: string; tools: string[]; ui?: RpcUi; uiPrefix?: string }): RpcWorker {
+export function createRpcWorker(options: {
+  cwd: string;
+  tools: string[];
+  ui?: RpcUi;
+  uiPrefix?: string;
+  uiDialogQueue?: RpcUiDialogQueue;
+}): RpcWorker {
   const bin = process.env.PI_DELEGATE_PI_BIN || "pi";
   const proc = spawn(
     bin,
@@ -153,34 +160,47 @@ export function createRpcWorker(options: { cwd: string; tools: string[]; ui?: Rp
     }
   };
 
-  const handleUiRequest = async (event: any) => {
+  const dialogMethods = new Set(["select", "confirm", "input", "editor"]);
+
+  const handleUiRequest = async (event: any, receivedAt: number) => {
+    const isDialog = dialogMethods.has(event.method);
     const ui = options.ui;
-    if (!event.id || !ui) {
-      if (event.id && ["select", "confirm", "input", "editor"].includes(event.method)) {
+    if (!event.id || !ui || disposed) {
+      if (event.id && isDialog) {
         respondToUiRequest(event.id, { cancelled: true });
       }
       return;
     }
 
+    const elapsedMs = Date.now() - receivedAt;
+    const timeout = typeof event.timeout === "number"
+      ? Math.max(0, event.timeout - elapsedMs)
+      : undefined;
+    if (isDialog && timeout === 0) {
+      respondToUiRequest(event.id, { cancelled: true });
+      return;
+    }
+
+    const dialogOptions = timeout === undefined ? undefined : { timeout };
     const prefix = options.uiPrefix ? `[${options.uiPrefix}] ` : "[delegate worker] ";
     try {
       if (event.method === "select") {
-        const value = await ui.select?.(`${prefix}${event.title ?? "Select"}`, event.options ?? [], { timeout: event.timeout });
+        const value = await ui.select?.(`${prefix}${event.title ?? "Select"}`, event.options ?? [], dialogOptions);
         respondToUiRequest(event.id, value === undefined ? { cancelled: true } : { value });
         return;
       }
       if (event.method === "confirm") {
-        const confirmed = await ui.confirm?.(`${prefix}${event.title ?? "Confirm"}`, event.message, { timeout: event.timeout });
+        const confirmed = await ui.confirm?.(`${prefix}${event.title ?? "Confirm"}`, event.message, dialogOptions);
         respondToUiRequest(event.id, { confirmed: Boolean(confirmed) });
         return;
       }
       if (event.method === "input") {
-        const value = await ui.input?.(`${prefix}${event.title ?? "Input"}`, event.placeholder, { timeout: event.timeout });
+        const value = await ui.input?.(`${prefix}${event.title ?? "Input"}`, event.placeholder, dialogOptions);
         respondToUiRequest(event.id, value === undefined ? { cancelled: true } : { value });
         return;
       }
       if (event.method === "editor") {
-        const value = await ui.editor?.(`${prefix}${event.title ?? "Edit"}`, event.prefill, { timeout: event.timeout });
+        const value = await ui.editor?.(`${prefix}${event.title ?? "Edit"}`, event.prefill, dialogOptions);
         respondToUiRequest(event.id, value === undefined ? { cancelled: true } : { value });
         return;
       }
@@ -204,7 +224,7 @@ export function createRpcWorker(options: { cwd: string; tools: string[]; ui?: Rp
         ui.setEditorText?.(String(event.text ?? ""));
       }
     } catch {
-      if (["select", "confirm", "input", "editor"].includes(event.method)) {
+      if (isDialog) {
         respondToUiRequest(event.id, { cancelled: true });
       }
     }
@@ -212,7 +232,13 @@ export function createRpcWorker(options: { cwd: string; tools: string[]; ui?: Rp
 
   parseJsonl(proc, (event) => {
     if (event.type === "extension_ui_request") {
-      void handleUiRequest(event);
+      const receivedAt = Date.now();
+      const handleRequest = () => handleUiRequest(event, receivedAt);
+      if (dialogMethods.has(event.method) && options.uiDialogQueue) {
+        void options.uiDialogQueue.enqueue(handleRequest);
+      } else {
+        void handleRequest();
+      }
     }
 
     if (!activePrompt) return;

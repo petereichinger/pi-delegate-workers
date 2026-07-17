@@ -47,6 +47,6 @@ When the workers finish, the extension returns compact per-worker summaries to t
 
 - Workers use pi's normal tool set by default, including `bash` for small independent scripts and `write`/`edit` for file changes. To make workers read-only, set `PI_DELEGATE_TOOLS=read,grep,find,ls`.
 - Since worker `bash` is enabled by default, any guard/approval extension you rely on must be loaded inside the worker process too. This extension reuses a parent `-e ...pi-tool-guard...` arg or auto-adds a sibling `../pi-tool-guard` checkout when present. When it does, it also uses `--no-extensions` by default to avoid loading a second/older globally installed guard. Otherwise install it globally/as a pi package, set `PI_DELEGATE_TOOL_GUARD_EXTENSION=/path/to/pi-tool-guard`, or use `PI_DELEGATE_EXTRA_ARGS='-e /path/to/pi-tool-guard'`.
-- Worker RPC extension UI requests are proxied back to the parent UI, so guard prompts from worker processes can be answered in the main session.
+- Worker RPC extension UI requests are proxied back to the parent UI, so guard prompts from worker processes can be answered in the main session. Dialog requests from parallel workers are queued and shown one at a time.
 - Workers run in the same cwd as the main session.
 - The extension expects `pi` to be available on your PATH unless `PI_DELEGATE_PI_BIN` is set.

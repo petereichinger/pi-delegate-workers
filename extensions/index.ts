@@ -8,6 +8,10 @@ import {
   type RpcEvent,
   type RpcWorker,
 } from "./rpc-worker.ts";
+import {
+  createRpcUiDialogQueue,
+  type RpcUiDialogQueue,
+} from "./ui-dialog-queue.ts";
 
 type WorkerState = {
   id: string;
@@ -168,13 +172,18 @@ async function runTask(
   workers: Map<string, WorkerState>,
   task: string,
   id: string,
-  options: { signal?: AbortSignal; sharedContext?: string },
+  options: {
+    signal?: AbortSignal;
+    sharedContext?: string;
+    uiDialogQueue: RpcUiDialogQueue;
+  },
 ): Promise<DelegatedResult> {
   const worker = createRpcWorker({
     cwd: ctx.cwd,
     tools: getWorkerTools(),
     ui: ctx.ui,
     uiPrefix: id,
+    uiDialogQueue: options.uiDialogQueue,
   });
   const state: WorkerState = {
     id,
@@ -295,6 +304,7 @@ async function runTask(
 
 export default function delegateWorkersExtension(pi: ExtensionAPI) {
   const workers = new Map<string, WorkerState>();
+  const uiDialogQueue = createRpcUiDialogQueue();
   let nextWorkerId = 1;
 
   const makeWorkerId = () => `w${nextWorkerId++}`;
@@ -329,7 +339,9 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
 
       ctx.ui.notify(`Launching ${tasks.length} delegate worker(s)...`, "info");
       const results = await Promise.all(
-        tasks.map((task) => runTask(ctx, workers, task, makeWorkerId(), {})),
+        tasks.map((task) =>
+          runTask(ctx, workers, task, makeWorkerId(), { uiDialogQueue }),
+        ),
       );
       const combined = formatResults(results);
       const payload = [
@@ -391,6 +403,7 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
           runTask(ctx, workers, task, makeWorkerId(), {
             signal,
             sharedContext: params.sharedContext,
+            uiDialogQueue,
           }),
         ),
       );
