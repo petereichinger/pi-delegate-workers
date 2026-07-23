@@ -43,26 +43,19 @@ type WorkerState = {
   model?: string | null;
   thinkingLevel?: DelegateProfileConfig["thinkingLevel"];
   status: string;
+  latestMessage: string;
   output: string;
   worker: RpcWorker;
 };
 
 type WorkerUiState = "starting" | "working" | "synthesizing" | "done" | "error";
 
-const WORKER_UI_STATES: WorkerUiState[] = [
-  "starting",
-  "working",
-  "synthesizing",
-  "done",
-  "error",
-];
-
 const WORKER_STATE_STYLES = {
-  starting: { icon: "", fg: "muted", bg: "selectedBg" },
-  working: { icon: "", fg: "accent", bg: "toolPendingBg" },
-  synthesizing: { icon: "", fg: "warning", bg: "toolPendingBg" },
-  done: { icon: "", fg: "success", bg: "toolSuccessBg" },
-  error: { icon: "", fg: "error", bg: "toolErrorBg" },
+  starting: { icon: "", fg: "muted" },
+  working: { icon: "", fg: "accent" },
+  synthesizing: { icon: "", fg: "warning" },
+  done: { icon: "", fg: "success" },
+  error: { icon: "", fg: "error" },
 } as const;
 
 type DelegatedResult = {
@@ -158,6 +151,7 @@ function buildWorkerPrompt(task: string, sharedContext?: string): string {
     "- stay tightly scoped to the assigned task",
     "- use only the available tools",
     "- cite concrete file paths when possible",
+    "- briefly state what you are currently working on before each new investigation step; these progress messages are shown live to the parent",
     "- gather the evidence you need, then stop; a separate synthesis pass will follow",
     ...(sharedContext ? ["", "Shared context:", sharedContext] : []),
     "",
@@ -223,35 +217,39 @@ function getWorkerUiState(status: string): WorkerUiState {
   return "working";
 }
 
-function refreshUi(ctx: ExtensionContext, workers: Map<string, WorkerState>) {
-  ctx.ui.setWidget("delegate-workers", undefined);
+function compactActivity(text: string, maxChars = 140): string {
+  const compact = text.replace(/\s+/g, " ").trim();
+  if (compact.length <= maxChars) return compact;
+  return `${compact.slice(0, maxChars - 1)}…`;
+}
 
+export function describeWorkerTool(event: RpcEvent): string {
+  const args = event.args ?? {};
+  const value = (key: string) => typeof args[key] === "string" ? compactActivity(args[key]) : "";
+  switch (event.toolName) {
+    case "read": return `Reading ${value("path") || "a file"}`;
+    case "write": return `Writing ${value("path") || "a file"}`;
+    case "edit": return `Editing ${value("path") || "a file"}`;
+    case "bash": return `Running ${value("command") || "a command"}`;
+    case "grep": return `Searching for ${value("pattern") || "matches"}`;
+    case "find": return `Finding ${value("pattern") || "files"}`;
+    default: return `Using ${event.toolName || "a tool"}`;
+  }
+}
+
+function refreshUi(ctx: ExtensionContext, workers: Map<string, WorkerState>) {
   if (workers.size === 0) {
-    ctx.ui.setStatus("delegate-workers", undefined);
+    ctx.ui.setWidget("delegate-workers", undefined);
     return;
   }
 
-  const counts: Record<WorkerUiState, number> = {
-    starting: 0,
-    working: 0,
-    synthesizing: 0,
-    done: 0,
-    error: 0,
-  };
-
-  for (const worker of workers.values()) {
-    counts[getWorkerUiState(worker.status)]++;
-  }
-
-  const summary = WORKER_UI_STATES.filter((state) => counts[state] > 0)
-    .map((state) => {
-      const style = WORKER_STATE_STYLES[state];
-      const text = ` ${style.icon} ${counts[state]} `;
-      return ctx.ui.theme.bg(style.bg, ctx.ui.theme.fg(style.fg, text));
-    })
-    .join(" ");
-
-  ctx.ui.setStatus("delegate-workers", summary);
+  const widgetLines = [...workers.values()].map((worker) => {
+    const uiState = getWorkerUiState(worker.status);
+    const style = WORKER_STATE_STYLES[uiState];
+    const label = ctx.ui.theme.fg(style.fg, `${style.icon} ${worker.id} [${worker.profile}]`);
+    return `${label} ${compactActivity(worker.latestMessage)}`;
+  });
+  ctx.ui.setWidget("delegate-workers", widgetLines, { placement: "aboveEditor" });
 }
 
 async function runTask(
@@ -281,6 +279,7 @@ async function runTask(
     model: task.model,
     thinkingLevel: task.thinkingLevel,
     status: "starting",
+    latestMessage: `Starting: ${task.task}`,
     output: "",
     worker,
   };
@@ -290,14 +289,22 @@ async function runTask(
   const startedAt = Date.now();
 
   const onEvent = (event: RpcEvent) => {
+    if (event.type === "message_start" && event.message?.role === "assistant") {
+      state.latestMessage = "Thinking about the next step";
+      refreshUi(ctx, workers);
+      return;
+    }
+
     if (event.type === "agent_start") {
       state.status = "running";
+      state.latestMessage = `Investigating: ${task.task}`;
       refreshUi(ctx, workers);
       return;
     }
 
     if (event.type === "tool_execution_start") {
       state.status = `tool:${event.toolName}`;
+      state.latestMessage = describeWorkerTool(event);
       refreshUi(ctx, workers);
       return;
     }
@@ -307,6 +314,9 @@ async function runTask(
       event.assistantMessageEvent?.type === "text_delta"
     ) {
       state.output += event.assistantMessageEvent.delta;
+      if (state.latestMessage === "Thinking about the next step") state.latestMessage = "";
+      state.latestMessage += event.assistantMessageEvent.delta;
+      refreshUi(ctx, workers);
       return;
     }
 
@@ -334,6 +344,7 @@ async function runTask(
     );
 
     state.status = "synthesizing";
+    state.latestMessage = "Synthesizing findings";
     state.output = "";
     refreshUi(ctx, workers);
 
@@ -342,8 +353,15 @@ async function runTask(
       const summary = await worker.prompt(buildSummaryPrompt(task.task), {
         signal: options.signal,
         onEvent: (event: RpcEvent) => {
+          if (event.type === "message_start" && event.message?.role === "assistant") {
+            state.latestMessage = "Synthesizing findings";
+            refreshUi(ctx, workers);
+            return;
+          }
+
           if (event.type === "agent_start") {
             state.status = "synthesizing";
+            state.latestMessage = "Synthesizing findings";
             refreshUi(ctx, workers);
             return;
           }
@@ -353,6 +371,9 @@ async function runTask(
             event.assistantMessageEvent?.type === "text_delta"
           ) {
             state.output += event.assistantMessageEvent.delta;
+            if (state.latestMessage === "Synthesizing findings") state.latestMessage = "";
+            state.latestMessage += event.assistantMessageEvent.delta;
+            refreshUi(ctx, workers);
             return;
           }
 
@@ -369,6 +390,7 @@ async function runTask(
     }
 
     state.output = summaryText;
+    state.latestMessage = "Done";
     state.status = "done";
     refreshUi(ctx, workers);
 
@@ -383,6 +405,7 @@ async function runTask(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     state.status = "error";
+    state.latestMessage = `Error: ${message}`;
     refreshUi(ctx, workers);
 
     return {
