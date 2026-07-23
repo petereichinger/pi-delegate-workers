@@ -2,6 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { ThinkingLevel } from "./config.ts";
 import type { RpcUiDialogQueue } from "./ui-dialog-queue.ts";
 
 export type RpcEvent = any;
@@ -17,7 +18,7 @@ export type RpcWorker = {
 
 type RpcUi = {
   select?: (title: string, options: string[], optionsArg?: any) => Promise<string | undefined>;
-  confirm?: (title: string, message?: string, optionsArg?: any) => Promise<boolean>;
+  confirm?: (title: string, message: string, optionsArg?: any) => Promise<boolean>;
   input?: (title: string, placeholder?: string, optionsArg?: any) => Promise<string | undefined>;
   editor?: (title: string, prefill?: string, optionsArg?: any) => Promise<string | undefined>;
   notify?: (message: string, type?: "info" | "warning" | "error") => void;
@@ -95,6 +96,10 @@ function isDisabled(value: string | undefined): boolean {
   return ["0", "false", "no", "off", "disabled"].includes(value?.trim().toLowerCase() ?? "");
 }
 
+function isEnabled(value: string | undefined): boolean {
+  return ["1", "true", "yes", "on", "enabled"].includes(value?.trim().toLowerCase() ?? "");
+}
+
 function resolveToolGuardExtension(): string | undefined {
   const mode = process.env.PI_DELEGATE_TOOL_GUARD?.trim().toLowerCase();
   if (isDisabled(mode)) return undefined;
@@ -113,23 +118,62 @@ function resolveToolGuardExtension(): string | undefined {
   return undefined;
 }
 
-function buildWorkerArgs(tools: string[]): string[] {
-  const extraArgs = splitExtraArgs(process.env.PI_DELEGATE_EXTRA_ARGS);
+export type WorkerRoutingOptions = {
+  model?: string | null;
+  thinkingLevel?: ThinkingLevel | null;
+};
+
+function removeOptions(args: string[], names: string[]): string[] {
+  const result: string[] = [];
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index]!;
+    const exact = names.includes(arg);
+    const assigned = names.some((name) => arg.startsWith(`${name}=`));
+    if (assigned) continue;
+    if (exact) {
+      index++;
+      continue;
+    }
+    result.push(arg);
+  }
+  return result;
+}
+
+export function buildWorkerArgs(
+  tools: string[],
+  routing: WorkerRoutingOptions = {},
+): string[] {
+  let extraArgs = splitExtraArgs(process.env.PI_DELEGATE_EXTRA_ARGS);
+  if (routing.model !== undefined) {
+    extraArgs = removeOptions(extraArgs, ["--model", "--provider"]);
+  }
+  if (routing.thinkingLevel !== undefined) {
+    extraArgs = removeOptions(extraArgs, ["--thinking"]);
+  }
+
   const args = ["--mode", "rpc", "--no-session", "--tools", tools.join(",")];
   const toolGuardExtension = resolveToolGuardExtension();
-  if (toolGuardExtension && !isDisabled(process.env.PI_DELEGATE_TOOL_GUARD_ISOLATE) && !hasNoExtensionsArg(extraArgs)) {
+  if (toolGuardExtension && isEnabled(process.env.PI_DELEGATE_TOOL_GUARD_ISOLATE) && !hasNoExtensionsArg(extraArgs)) {
     args.push("--no-extensions");
   }
   if (toolGuardExtension && !hasToolGuardExtensionArg(extraArgs)) {
     args.push("--extension", toolGuardExtension);
   }
   args.push(...extraArgs);
+  if (typeof routing.model === "string") {
+    args.push("--model", routing.model);
+  }
+  if (typeof routing.thinkingLevel === "string") {
+    args.push("--thinking", routing.thinkingLevel);
+  }
   return args;
 }
 
 export function createRpcWorker(options: {
   cwd: string;
   tools: string[];
+  model?: string | null;
+  thinkingLevel?: ThinkingLevel | null;
   ui?: RpcUi;
   uiPrefix?: string;
   uiDialogQueue?: RpcUiDialogQueue;
@@ -137,7 +181,10 @@ export function createRpcWorker(options: {
   const bin = process.env.PI_DELEGATE_PI_BIN || "pi";
   const proc = spawn(
     bin,
-    buildWorkerArgs(options.tools),
+    buildWorkerArgs(options.tools, {
+      model: options.model,
+      thinkingLevel: options.thinkingLevel,
+    }),
     {
       cwd: options.cwd,
       stdio: ["pipe", "pipe", "pipe"],
@@ -190,7 +237,7 @@ export function createRpcWorker(options: {
         return;
       }
       if (event.method === "confirm") {
-        const confirmed = await ui.confirm?.(`${prefix}${event.title ?? "Confirm"}`, event.message, dialogOptions);
+        const confirmed = await ui.confirm?.(`${prefix}${event.title ?? "Confirm"}`, String(event.message ?? ""), dialogOptions);
         respondToUiRequest(event.id, { confirmed: Boolean(confirmed) });
         return;
       }

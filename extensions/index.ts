@@ -1,8 +1,19 @@
+import {
+  getSupportedThinkingLevels,
+  StringEnum,
+} from "@earendil-works/pi-ai";
 import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import {
+  delegateConfigLoader,
+  PROFILE_NAMES,
+  type DelegateProfileConfig,
+  type ProfileName,
+  type ResolvedDelegateConfig,
+} from "./config.ts";
 import {
   createRpcWorker,
   type RpcEvent,
@@ -13,9 +24,24 @@ import {
   type RpcUiDialogQueue,
 } from "./ui-dialog-queue.ts";
 
+type TaskRequest = {
+  task: string;
+  profile?: ProfileName;
+};
+
+type RoutedTask = {
+  task: string;
+  profile: ProfileName;
+  model?: string | null;
+  thinkingLevel?: DelegateProfileConfig["thinkingLevel"];
+};
+
 type WorkerState = {
   id: string;
   task: string;
+  profile: ProfileName;
+  model?: string | null;
+  thinkingLevel?: DelegateProfileConfig["thinkingLevel"];
   status: string;
   output: string;
   worker: RpcWorker;
@@ -42,6 +68,9 @@ const WORKER_STATE_STYLES = {
 type DelegatedResult = {
   id: string;
   task: string;
+  profile: ProfileName;
+  model?: string | null;
+  thinkingLevel?: DelegateProfileConfig["thinkingLevel"];
   ok: boolean;
   output: string;
   rawOutput: string;
@@ -69,11 +98,56 @@ function getMaxWorkers(): number {
     : DEFAULT_MAX_WORKERS;
 }
 
-function parseTasks(text: string): string[] {
+export function parseCommandTasks(text: string): TaskRequest[] {
   return text
     .split("|")
     .map((part) => part.trim())
-    .filter(Boolean);
+    .filter(Boolean)
+    .map((part) => {
+      const match = part.match(/^\[(fast|balanced|deep)\]\s*(.*)$/s);
+      return match
+        ? { task: match[2]!.trim(), profile: match[1] as ProfileName }
+        : { task: part };
+    })
+    .filter((task) => task.task.length > 0);
+}
+
+export function routeTasks(
+  ctx: ExtensionContext,
+  tasks: TaskRequest[],
+  config: ResolvedDelegateConfig,
+): RoutedTask[] {
+  return tasks.map((request) => {
+    const profile = request.profile ?? config.defaultProfile;
+    const profileConfig = config.profiles[profile];
+    const routed: RoutedTask = {
+      task: request.task,
+      profile,
+      ...profileConfig,
+    };
+
+    if (typeof routed.model === "string") {
+      const separator = routed.model.indexOf("/");
+      const provider = routed.model.slice(0, separator);
+      const modelId = routed.model.slice(separator + 1);
+      const model = ctx.modelRegistry.find(provider, modelId);
+      if (!model) {
+        throw new Error(
+          `delegate-workers profile ${profile}: model not found: ${routed.model}`,
+        );
+      }
+      if (typeof routed.thinkingLevel === "string") {
+        const supported = getSupportedThinkingLevels(model);
+        if (!supported.includes(routed.thinkingLevel)) {
+          throw new Error(
+            `delegate-workers profile ${profile}: ${routed.model} does not support thinking level ${routed.thinkingLevel}; supported: ${supported.join(", ")}`,
+          );
+        }
+      }
+    }
+
+    return routed;
+  });
 }
 
 function buildWorkerPrompt(task: string, sharedContext?: string): string {
@@ -85,13 +159,11 @@ function buildWorkerPrompt(task: string, sharedContext?: string): string {
     "- use only the available tools",
     "- cite concrete file paths when possible",
     "- gather the evidence you need, then stop; a separate synthesis pass will follow",
-    sharedContext ? "Shared context:" : undefined,
+    ...(sharedContext ? ["", "Shared context:", sharedContext] : []),
     "",
     "Assigned task:",
     task,
-  ]
-    .filter((line): line is string => Boolean(line))
-    .join("\n");
+  ].join("\n");
 }
 
 function buildSummaryPrompt(task: string): string {
@@ -117,13 +189,28 @@ function truncateFallback(text: string, maxChars = 2000): string {
   return `${trimmed.slice(0, maxChars)}\n\n[truncated before returning to parent agent]`;
 }
 
+function configuredValue(value: string | null | undefined): string {
+  if (typeof value === "string") return value;
+  return value === null ? "pi-default" : "worker-startup";
+}
+
 function formatResults(results: DelegatedResult[]): string {
   return results
     .map((result) => {
       const header = `## ${result.id} — ${result.task}`;
       const status = result.ok ? "ok" : "error";
       const body = result.output.trim() || "(no output)";
-      return `${header}\n\nstatus: ${status}\nduration_ms: ${result.durationMs}\n\n${body}`;
+      return [
+        header,
+        "",
+        `status: ${status}`,
+        `profile: ${result.profile}`,
+        `model: ${configuredValue(result.model)}`,
+        `thinking: ${configuredValue(result.thinkingLevel)}`,
+        `duration_ms: ${result.durationMs}`,
+        "",
+        body,
+      ].join("\n");
     })
     .join("\n\n---\n\n");
 }
@@ -170,7 +257,7 @@ function refreshUi(ctx: ExtensionContext, workers: Map<string, WorkerState>) {
 async function runTask(
   ctx: ExtensionContext,
   workers: Map<string, WorkerState>,
-  task: string,
+  task: RoutedTask,
   id: string,
   options: {
     signal?: AbortSignal;
@@ -181,13 +268,18 @@ async function runTask(
   const worker = createRpcWorker({
     cwd: ctx.cwd,
     tools: getWorkerTools(),
+    model: task.model,
+    thinkingLevel: task.thinkingLevel,
     ui: ctx.ui,
     uiPrefix: id,
     uiDialogQueue: options.uiDialogQueue,
   });
   const state: WorkerState = {
     id,
-    task,
+    task: task.task,
+    profile: task.profile,
+    model: task.model,
+    thinkingLevel: task.thinkingLevel,
     status: "starting",
     output: "",
     worker,
@@ -224,9 +316,17 @@ async function runTask(
     }
   };
 
+  const resultBase = {
+    id,
+    task: task.task,
+    profile: task.profile,
+    model: task.model,
+    thinkingLevel: task.thinkingLevel,
+  };
+
   try {
     const investigation = await worker.prompt(
-      buildWorkerPrompt(task, options.sharedContext),
+      buildWorkerPrompt(task.task, options.sharedContext),
       {
         onEvent,
         signal: options.signal,
@@ -239,7 +339,7 @@ async function runTask(
 
     let summaryText = truncateFallback(investigation.text);
     try {
-      const summary = await worker.prompt(buildSummaryPrompt(task), {
+      const summary = await worker.prompt(buildSummaryPrompt(task.task), {
         signal: options.signal,
         onEvent: (event: RpcEvent) => {
           if (event.type === "agent_start") {
@@ -273,8 +373,7 @@ async function runTask(
     refreshUi(ctx, workers);
 
     return {
-      id,
-      task,
+      ...resultBase,
       ok: true,
       output: summaryText,
       rawOutput: investigation.text,
@@ -287,8 +386,7 @@ async function runTask(
     refreshUi(ctx, workers);
 
     return {
-      id,
-      task,
+      ...resultBase,
       ok: false,
       output: message,
       rawOutput: message,
@@ -311,6 +409,23 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     refreshUi(ctx, workers);
+    delegateConfigLoader.invalidate();
+    try {
+      const loaded = await delegateConfigLoader.load(ctx);
+      if (loaded.warnings.length > 0 && ctx.hasUI) {
+        ctx.ui.notify(
+          `delegate-workers config warnings:\n${loaded.warnings.join("\n")}`,
+          "warning",
+        );
+      }
+    } catch (error) {
+      if (ctx.hasUI) {
+        ctx.ui.notify(
+          error instanceof Error ? error.message : String(error),
+          "error",
+        );
+      }
+    }
   });
 
   pi.on("session_shutdown", async () => {
@@ -322,21 +437,26 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
 
   pi.registerCommand("delegate", {
     description:
-      "Delegate parallel tasks using configured worker tools and synthesize the worker summaries in chat",
+      "Delegate parallel tasks using configured worker profiles and synthesize the worker summaries in chat",
     handler: async (args, ctx) => {
-      const tasks = parseTasks(args);
+      const requestedTasks = parseCommandTasks(args);
       const maxWorkers = getMaxWorkers();
 
-      if (tasks.length === 0) {
-        ctx.ui.notify("Usage: /delegate task A | task B | task C", "warning");
+      if (requestedTasks.length === 0) {
+        ctx.ui.notify(
+          "Usage: /delegate [fast] task A | [deep] task B",
+          "warning",
+        );
         return;
       }
 
-      if (tasks.length > maxWorkers) {
+      if (requestedTasks.length > maxWorkers) {
         ctx.ui.notify(`Too many tasks. Max is ${maxWorkers}.`, "warning");
         return;
       }
 
+      const loaded = await delegateConfigLoader.load(ctx);
+      const tasks = routeTasks(ctx, requestedTasks, loaded.config);
       ctx.ui.notify(`Launching ${tasks.length} delegate worker(s)...`, "info");
       const results = await Promise.all(
         tasks.map((task) =>
@@ -346,10 +466,10 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
       const combined = formatResults(results);
       const payload = [
         {
-          type: "text",
+          type: "text" as const,
           text: "I ran delegated workers. Please synthesize their compact per-worker summaries into one answer for me.",
         },
-        { type: "text", text: combined },
+        { type: "text" as const, text: combined },
       ];
 
       if (ctx.isIdle()) {
@@ -360,22 +480,33 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
     },
   });
 
+  const taskSchema = Type.Object({
+    task: Type.String({ description: "Focused task for one delegated worker" }),
+    profile: Type.Optional(
+      StringEnum(PROFILE_NAMES, {
+        description:
+          "fast for lookups and summaries; balanced for routine multi-file work; deep for architecture, security, migrations, or ambiguous root causes",
+      }),
+    ),
+  });
+
   pi.registerTool({
     name: "delegate_tasks",
     label: "Delegate Tasks",
     description:
-      "Run multiple focused tasks in parallel using pi RPC workers with the configured worker tools",
+      "Run multiple focused tasks in parallel using agent-selected configured worker profiles",
     promptSnippet:
-      "Run a few independent tasks in parallel using configured delegate worker tools and return combined findings.",
+      "Run independent tasks in parallel and select fast, balanced, or deep worker profiles based on complexity.",
     promptGuidelines: [
       "Use delegate_tasks for independent subtasks that can run in parallel.",
+      "For delegate_tasks, select profile fast for lookups, searches, summaries, and isolated checks; balanced for multi-file tracing, routine changes, and test diagnosis; deep for architecture, security, migrations, and ambiguous root causes.",
       "Workers use pi's normal tool set by default (read, write, edit, bash), and can be reconfigured via PI_DELEGATE_TOOLS.",
       "Only delegate tasks that fit the currently configured worker tool allowlist; use PI_DELEGATE_TOOLS=read,grep,find,ls for read-only workers.",
     ],
     parameters: Type.Object({
-      tasks: Type.Array(Type.String(), {
+      tasks: Type.Array(taskSchema, {
         minItems: 1,
-        maxItems: DEFAULT_MAX_WORKERS,
+        maxItems: getMaxWorkers(),
       }),
       sharedContext: Type.Optional(
         Type.String({
@@ -383,23 +514,37 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
         }),
       ),
     }),
+    prepareArguments(args) {
+      if (!args || typeof args !== "object" || Array.isArray(args)) return args as any;
+      const input = args as { tasks?: unknown };
+      if (!Array.isArray(input.tasks)) return args as any;
+      return {
+        ...input,
+        tasks: input.tasks.map((task) =>
+          typeof task === "string" ? { task } : task,
+        ),
+      } as any;
+    },
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const maxWorkers = getMaxWorkers();
       if (params.tasks.length > maxWorkers) {
         throw new Error(`Too many tasks. Max is ${maxWorkers}.`);
       }
 
+      const loaded = await delegateConfigLoader.load(ctx);
+      const tasks = routeTasks(ctx, params.tasks, loaded.config);
       onUpdate?.({
         content: [
           {
             type: "text",
-            text: `Launching ${params.tasks.length} delegate worker(s)...`,
+            text: `Launching ${tasks.length} delegate worker(s)...`,
           },
         ],
+        details: {},
       });
 
       const results = await Promise.all(
-        params.tasks.map((task) =>
+        tasks.map((task) =>
           runTask(ctx, workers, task, makeWorkerId(), {
             signal,
             sharedContext: params.sharedContext,
@@ -416,6 +561,12 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
         details: {
           taskCount: results.length,
           failedTasks: failed,
+          routes: results.map((result) => ({
+            id: result.id,
+            profile: result.profile,
+            model: result.model,
+            thinkingLevel: result.thinkingLevel,
+          })),
         },
       };
     },

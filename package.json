@@ -8,7 +8,8 @@
   ],
   "type": "module",
   "scripts": {
-    "test": "node --test tests/*.test.ts"
+    "test": "node --test tests/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json"
   },
   "pi": {
     "extensions": [
@@ -16,7 +17,15 @@
     ]
   },
   "peerDependencies": {
+    "@earendil-works/pi-ai": "^0.81.1",
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
+  },
+  "dependencies": {
+    "pi-scoped-config": "git+https://github.com/petereichinger/pi-scoped-config.git#v0.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "typescript": "^7.0.2"
   }
 }
