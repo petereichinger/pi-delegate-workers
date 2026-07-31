@@ -10,7 +10,7 @@ It launches separate `pi --mode rpc` worker processes, runs configured tasks in 
 - `delegate_tasks` with parent-agent-selected `fast`, `balanced`, or `deep` profiles
 - per-profile model and thinking level configuration
 - global, Git-repository, and current-directory JSON configuration
-- live per-worker activity widget
+- live per-worker widget with a stable goal line and changing current activity
 - progress text and current tool activity streamed from each worker over RPC
 - per-worker synthesis before returning results to the parent
 - normal pi worker tool set by default (`read,write,edit,bash`)
@@ -133,7 +133,7 @@ When a resolved profile controls the model or thinking level, conflicting `--pro
 ## Notes
 
 - Workers run in the same CWD as the main session.
-- Worker RPC events update a live parent widget with the latest progress message or tool activity for each agent.
+- The live parent widget keeps each worker's assigned goal visible on a stable line while RPC events update a separate current-activity line.
 - Worker extension UI requests are proxied to the parent UI and parallel dialogs are queued.
 - Tool-guard is reused from a parent extension argument or an adjacent `pi-tool-guard` checkout when available. Worker extension discovery stays enabled by default so extension-provided models remain available; set `PI_DELEGATE_TOOL_GUARD_ISOLATE=1` only when duplicate guard discovery is a problem.
 - Read-only workers can be configured with `PI_DELEGATE_TOOLS=read,grep,find,ls`.

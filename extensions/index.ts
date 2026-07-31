@@ -237,17 +237,28 @@ export function describeWorkerTool(event: RpcEvent): string {
   }
 }
 
+export function formatWorkerDisplayLines(
+  label: string,
+  task: string,
+  latestMessage: string,
+): [string, string] {
+  return [
+    `${label} Goal: ${compactActivity(task)}`,
+    `  Now: ${compactActivity(latestMessage)}`,
+  ];
+}
+
 function refreshUi(ctx: ExtensionContext, workers: Map<string, WorkerState>) {
   if (workers.size === 0) {
     ctx.ui.setWidget("delegate-workers", undefined);
     return;
   }
 
-  const widgetLines = [...workers.values()].map((worker) => {
+  const widgetLines = [...workers.values()].flatMap((worker) => {
     const uiState = getWorkerUiState(worker.status);
     const style = WORKER_STATE_STYLES[uiState];
     const label = ctx.ui.theme.fg(style.fg, `${style.icon} ${worker.id} [${worker.profile}]`);
-    return `${label} ${compactActivity(worker.latestMessage)}`;
+    return formatWorkerDisplayLines(label, worker.task, worker.latestMessage);
   });
   ctx.ui.setWidget("delegate-workers", widgetLines, { placement: "aboveEditor" });
 }
