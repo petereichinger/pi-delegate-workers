@@ -272,6 +272,7 @@ async function runTask(
     signal?: AbortSignal;
     sharedContext?: string;
     uiDialogQueue: RpcUiDialogQueue;
+    reportInputStatus: (active: boolean, label?: string) => void;
   },
 ): Promise<DelegatedResult> {
   const worker = createRpcWorker({
@@ -282,6 +283,7 @@ async function runTask(
     ui: ctx.ui,
     uiPrefix: id,
     uiDialogQueue: options.uiDialogQueue,
+    reportInputStatus: options.reportInputStatus,
   });
   const state: WorkerState = {
     id,
@@ -440,6 +442,9 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
   let nextWorkerId = 1;
 
   const makeWorkerId = () => `w${nextWorkerId++}`;
+  const reportInputStatus = (active: boolean, label?: string) => {
+    pi.events.emit("herdr:blocked", { active, label });
+  };
 
   pi.on("session_start", async (_event, ctx) => {
     refreshUi(ctx, workers);
@@ -494,7 +499,10 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
       ctx.ui.notify(`Launching ${tasks.length} delegate worker(s)...`, "info");
       const results = await Promise.all(
         tasks.map((task) =>
-          runTask(ctx, workers, task, makeWorkerId(), { uiDialogQueue }),
+          runTask(ctx, workers, task, makeWorkerId(), {
+            uiDialogQueue,
+            reportInputStatus,
+          }),
         ),
       );
       const combined = formatResults(results);
@@ -583,6 +591,7 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
             signal,
             sharedContext: params.sharedContext,
             uiDialogQueue,
+            reportInputStatus,
           }),
         ),
       );

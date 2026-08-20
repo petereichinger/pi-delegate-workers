@@ -41,6 +41,28 @@ function randomId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+export async function withInputStatus<T>(
+  report: ((active: boolean, label?: string) => void) | undefined,
+  label: string,
+  action: () => Promise<T>,
+): Promise<T> {
+  try {
+    report?.(true, label);
+  } catch {
+    // Status reporting must never prevent the worker dialog.
+  }
+
+  try {
+    return await action();
+  } finally {
+    try {
+      report?.(false);
+    } catch {
+      // Keep the dialog result authoritative if status cleanup fails.
+    }
+  }
+}
+
 function parseJsonl(proc: ChildProcessWithoutNullStreams, onEvent: (event: RpcEvent) => void) {
   let buffer = "";
 
@@ -177,6 +199,7 @@ export function createRpcWorker(options: {
   ui?: RpcUi;
   uiPrefix?: string;
   uiDialogQueue?: RpcUiDialogQueue;
+  reportInputStatus?: (active: boolean, label?: string) => void;
 }): RpcWorker {
   const bin = process.env.PI_DELEGATE_PI_BIN || "pi";
   const proc = spawn(
@@ -230,7 +253,8 @@ export function createRpcWorker(options: {
 
     const dialogOptions = timeout === undefined ? undefined : { timeout };
     const prefix = options.uiPrefix ? `[${options.uiPrefix}] ` : "[delegate worker] ";
-    try {
+    const inputLabel = `${prefix}${event.title ?? "Waiting for input"}`;
+    const invokeUiMethod = async () => {
       if (event.method === "select") {
         const value = await ui.select?.(`${prefix}${event.title ?? "Select"}`, event.options ?? [], dialogOptions);
         respondToUiRequest(event.id, value === undefined ? { cancelled: true } : { value });
@@ -269,6 +293,14 @@ export function createRpcWorker(options: {
       }
       if (event.method === "set_editor_text") {
         ui.setEditorText?.(String(event.text ?? ""));
+      }
+    };
+
+    try {
+      if (isDialog) {
+        await withInputStatus(options.reportInputStatus, inputLabel, invokeUiMethod);
+      } else {
+        await invokeUiMethod();
       }
     } catch {
       if (isDialog) {

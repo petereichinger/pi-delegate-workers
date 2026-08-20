@@ -134,6 +134,6 @@ When a resolved profile controls the model or thinking level, conflicting `--pro
 
 - Workers run in the same CWD as the main session.
 - The live parent widget keeps each worker's assigned goal visible on a stable line while RPC events update a separate current-activity line.
-- Worker extension UI requests are proxied to the parent UI and parallel dialogs are queued.
+- Worker extension UI requests are proxied to the parent UI and parallel dialogs are queued. While a proxied dialog is open, the parent emits `herdr:blocked` so the authoritative TUI integration reports that it is waiting for input.
 - Tool-guard is reused from a parent extension argument or an adjacent `pi-tool-guard` checkout when available. Worker extension discovery stays enabled by default so extension-provided models remain available; set `PI_DELEGATE_TOOL_GUARD_ISOLATE=1` only when duplicate guard discovery is a problem.
 - Read-only workers can be configured with `PI_DELEGATE_TOOLS=read,grep,find,ls`.
