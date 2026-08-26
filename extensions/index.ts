@@ -46,15 +46,18 @@ type WorkerState = {
   latestMessage: string;
   output: string;
   worker: RpcWorker;
+  abortController: AbortController;
+  cancelRequested: boolean;
 };
 
-type WorkerUiState = "starting" | "working" | "synthesizing" | "done" | "error";
+type WorkerUiState = "starting" | "working" | "synthesizing" | "done" | "cancelled" | "error";
 
 const WORKER_STATE_STYLES = {
   starting: { icon: "", fg: "muted" },
   working: { icon: "", fg: "accent" },
   synthesizing: { icon: "", fg: "warning" },
   done: { icon: "", fg: "success" },
+  cancelled: { icon: "", fg: "warning" },
   error: { icon: "", fg: "error" },
 } as const;
 
@@ -65,6 +68,7 @@ type DelegatedResult = {
   model?: string | null;
   thinkingLevel?: DelegateProfileConfig["thinkingLevel"];
   ok: boolean;
+  cancelled: boolean;
   output: string;
   rawOutput: string;
   summaryOutput: string;
@@ -89,6 +93,21 @@ function getMaxWorkers(): number {
   return Number.isFinite(raw) && raw > 0
     ? Math.floor(raw)
     : DEFAULT_MAX_WORKERS;
+}
+
+export function normalizeWorkerId(text: string): string | undefined {
+  const match = text.trim().match(/^(?:w)?([1-9]\d*)$/i);
+  return match ? `w${match[1]}` : undefined;
+}
+
+export function requestWorkerCancellation(state: {
+  abortController: AbortController;
+  cancelRequested: boolean;
+}): boolean {
+  if (state.cancelRequested) return false;
+  state.cancelRequested = true;
+  state.abortController.abort();
+  return true;
 }
 
 export function parseCommandTasks(text: string): TaskRequest[] {
@@ -192,7 +211,7 @@ function formatResults(results: DelegatedResult[]): string {
   return results
     .map((result) => {
       const header = `## ${result.id} — ${result.task}`;
-      const status = result.ok ? "ok" : "error";
+      const status = result.cancelled ? "cancelled" : result.ok ? "ok" : "error";
       const body = result.output.trim() || "(no output)";
       return [
         header,
@@ -212,6 +231,7 @@ function formatResults(results: DelegatedResult[]): string {
 function getWorkerUiState(status: string): WorkerUiState {
   if (status === "synthesizing") return "synthesizing";
   if (status === "done") return "done";
+  if (status === "cancelled") return "cancelled";
   if (status === "error") return "error";
   if (status === "starting") return "starting";
   return "working";
@@ -275,6 +295,10 @@ async function runTask(
     reportInputStatus: (active: boolean, label?: string) => void;
   },
 ): Promise<DelegatedResult> {
+  const abortController = new AbortController();
+  const signal = options.signal
+    ? AbortSignal.any([options.signal, abortController.signal])
+    : abortController.signal;
   const worker = createRpcWorker({
     cwd: ctx.cwd,
     tools: getWorkerTools(),
@@ -295,6 +319,8 @@ async function runTask(
     latestMessage: `Starting: ${task.task}`,
     output: "",
     worker,
+    abortController,
+    cancelRequested: false,
   };
 
   workers.set(id, state);
@@ -352,7 +378,7 @@ async function runTask(
       buildWorkerPrompt(task.task, options.sharedContext),
       {
         onEvent,
-        signal: options.signal,
+        signal,
       },
     );
 
@@ -364,7 +390,7 @@ async function runTask(
     let summaryText = truncateFallback(investigation.text);
     try {
       const summary = await worker.prompt(buildSummaryPrompt(task.task), {
-        signal: options.signal,
+        signal,
         onEvent: (event: RpcEvent) => {
           if (event.type === "message_start" && event.message?.role === "assistant") {
             state.latestMessage = "Synthesizing findings";
@@ -398,7 +424,8 @@ async function runTask(
       });
 
       summaryText = summary.text.trim() || summaryText;
-    } catch {
+    } catch (error) {
+      if (signal.aborted) throw error;
       state.output = summaryText;
     }
 
@@ -410,20 +437,25 @@ async function runTask(
     return {
       ...resultBase,
       ok: true,
+      cancelled: false,
       output: summaryText,
       rawOutput: investigation.text,
       summaryOutput: summaryText,
       durationMs: Date.now() - startedAt,
     };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    state.status = "error";
-    state.latestMessage = `Error: ${message}`;
+    const cancelled = state.cancelRequested;
+    const message = cancelled
+      ? `Worker ${id} was cancelled.`
+      : error instanceof Error ? error.message : String(error);
+    state.status = cancelled ? "cancelled" : "error";
+    state.latestMessage = cancelled ? "Cancelled" : `Error: ${message}`;
     refreshUi(ctx, workers);
 
     return {
       ...resultBase,
       ok: false,
+      cancelled,
       output: message,
       rawOutput: message,
       summaryOutput: message,
@@ -472,6 +504,43 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
       worker.worker.dispose();
     }
     workers.clear();
+  });
+
+  pi.registerCommand("cancel-worker", {
+    description: "Cancel one running delegate worker by ID",
+    getArgumentCompletions: (prefix) => {
+      const normalizedPrefix = prefix.trim().toLowerCase();
+      const items = [...workers.keys()]
+        .filter((id) =>
+          id.toLowerCase().startsWith(normalizedPrefix) ||
+          id.slice(1).startsWith(normalizedPrefix)
+        )
+        .map((id) => ({ value: id.slice(1), label: id }));
+      return items.length > 0 ? items : null;
+    },
+    handler: async (args, ctx) => {
+      const id = normalizeWorkerId(args);
+      if (!id) {
+        ctx.ui.notify("Usage: /cancel-worker <worker-id>", "warning");
+        return;
+      }
+
+      const state = workers.get(id);
+      if (!state || state.cancelRequested) {
+        const active = [...workers.keys()];
+        const suffix = active.length > 0
+          ? ` Active workers: ${active.join(", ")}.`
+          : " No workers are currently running.";
+        ctx.ui.notify(`Worker ${id} is not running.${suffix}`, "warning");
+        return;
+      }
+
+      requestWorkerCancellation(state);
+      state.status = "cancelled";
+      state.latestMessage = "Cancelling";
+      refreshUi(ctx, workers);
+      ctx.ui.notify(`Cancelling worker ${id}...`, "info");
+    },
   });
 
   pi.registerCommand("delegate", {
@@ -598,12 +667,14 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
 
       const combined = formatResults(results);
       const failed = results.filter((result) => !result.ok).length;
+      const cancelled = results.filter((result) => result.cancelled).length;
 
       return {
         content: [{ type: "text", text: combined }],
         details: {
           taskCount: results.length,
           failedTasks: failed,
+          cancelledTasks: cancelled,
           routes: results.map((result) => ({
             id: result.id,
             profile: result.profile,

@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseCommandTasks, routeTasks } from "../extensions/index.ts";
+import {
+  normalizeWorkerId,
+  parseCommandTasks,
+  requestWorkerCancellation,
+  routeTasks,
+} from "../extensions/index.ts";
 import type { ResolvedDelegateConfig } from "../extensions/config.ts";
 
 const config: ResolvedDelegateConfig = {
@@ -41,6 +46,24 @@ function contextWithModels() {
     },
   } as any;
 }
+
+test("normalizes numeric and prefixed worker IDs", () => {
+  assert.equal(normalizeWorkerId("13"), "w13");
+  assert.equal(normalizeWorkerId(" w13 "), "w13");
+  assert.equal(normalizeWorkerId("W2"), "w2");
+  assert.equal(normalizeWorkerId("0"), undefined);
+  assert.equal(normalizeWorkerId("13 extra"), undefined);
+});
+
+test("cancels a worker only once", () => {
+  const abortController = new AbortController();
+  const state = { abortController, cancelRequested: false };
+
+  assert.equal(requestWorkerCancellation(state), true);
+  assert.equal(state.cancelRequested, true);
+  assert.equal(abortController.signal.aborted, true);
+  assert.equal(requestWorkerCancellation(state), false);
+});
 
 test("parses optional slash-command profile annotations", () => {
   assert.deepEqual(
