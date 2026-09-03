@@ -2,13 +2,17 @@
 
 A local pi package that adds a `/delegate` command and a `delegate_tasks` tool.
 
-It launches separate `pi --mode rpc` worker processes, runs configured tasks in parallel, asks each worker to synthesize its own findings, and returns compact summaries to the main session.
+It launches separate `pi --mode rpc` worker processes, runs configured tasks through a session-scoped background queue, and lets the parent collect early results or add follow-up workers while other tasks continue.
 
 ## What it does
 
-- `/delegate [fast] task A | [deep] task B`
-- `/cancel-worker 13` to cancel the running worker shown as `w13` in the live widget (the `w13` form is also accepted)
-- `delegate_tasks` with parent-agent-selected `fast`, `balanced`, or `deep` profiles
+- `/delegate [fast] task A | [deep] task B` starts a background batch
+- `/cancel-worker 13` cancels a queued or running worker shown as `w13` (the `w13` form is also accepted)
+- `delegate_tasks` starts a batch and returns immediately
+- `delegate_results` collects available results or waits for the next/all results
+- `delegate_add_tasks` adds adaptive follow-up work while existing workers continue
+- `delegate_cancel` cancels a worker or batch from the parent agent
+- global concurrency scheduling across all active batches
 - per-profile model and thinking level configuration
 - global, Git-repository, and current-directory JSON configuration
 - live per-worker widget with a stable goal line and changing current activity
@@ -96,7 +100,9 @@ Set a property to `null` to clear an inherited value and use pi's startup defaul
 
 ## Tool usage
 
-The current tool schema uses structured tasks:
+### Start a batch
+
+`delegate_tasks` uses structured tasks and always returns immediately with a batch ID and worker IDs:
 
 ```json
 {
@@ -109,7 +115,51 @@ The current tool schema uses structured tasks:
 }
 ```
 
-The profile is optional and falls back to `defaultProfile`. Legacy calls containing string tasks are normalized automatically.
+The profile is optional and falls back to `defaultProfile`. Legacy calls containing string tasks are normalized automatically. Starting a batch does not wait for summaries.
+
+### Collect results
+
+The parent chooses whether to inspect completed work immediately or wait:
+
+```json
+{ "batchId": "b1", "waitFor": "available" }
+```
+
+- `available` returns all currently completed, undelivered results immediately.
+- `next` waits for at least one new result.
+- `all` waits until every task in the batch is completed, failed, or cancelled.
+
+`next` and `all` accept an optional `timeoutMs` up to 300000. Results are delivered once, in completion order. Every response also reports queued, running, completed, failed, cancelled, and ready-result counts.
+
+### Add follow-up work
+
+The parent can add tasks to a batch after learning from early results:
+
+```json
+{
+  "batchId": "b1",
+  "tasks": [
+    { "task": "Inspect the refresh race reported by w2", "profile": "deep" }
+  ],
+  "sharedContext": "Extra context for these new tasks"
+}
+```
+
+Tasks start as global capacity becomes available; existing workers continue uninterrupted.
+
+### Cancel work
+
+```json
+{ "workerId": "w3" }
+```
+
+or:
+
+```json
+{ "batchId": "b1" }
+```
+
+Provide exactly one target to `delegate_cancel`.
 
 Each worker starts with the resolved profile on its command line:
 
@@ -123,7 +173,7 @@ The same model and thinking level are used for investigation and the worker's sy
 
 - `PI_DELEGATE_PI_BIN` — worker pi binary/path (default: `pi`)
 - `PI_DELEGATE_TOOLS` — comma-separated worker tool allowlist (default: `read,write,edit,bash`)
-- `PI_DELEGATE_MAX_WORKERS` — maximum tasks per batch (default: `5`)
+- `PI_DELEGATE_MAX_WORKERS` — maximum simultaneously running workers globally, and maximum tasks accepted by one start/add call (default: `5`)
 - `PI_DELEGATE_EXTRA_ARGS` — additional worker CLI arguments
 - `PI_DELEGATE_TOOL_GUARD` — tool-guard auto-loading mode; set `0`/`false` to disable or `1`/`required` to force
 - `PI_DELEGATE_TOOL_GUARD_EXTENSION` — explicit tool-guard extension source/path
@@ -133,8 +183,9 @@ When a resolved profile controls the model or thinking level, conflicting `--pro
 
 ## Notes
 
-- Workers run in the same CWD as the main session.
-- The live parent widget keeps each worker's assigned goal and ID visible on a stable line while RPC events update a separate current-activity line. Use `/cancel-worker <id>` to stop one worker without stopping the others.
+- Workers run in the same CWD as the main session. Background write-enabled workers can conflict with the parent or each other; prefer `PI_DELEGATE_TOOLS=read,grep,find,ls` for exploratory batches.
+- Batches and result delivery live for the current session. Session shutdown cancels queued and running work.
+- The live parent widget keeps queued/running workers' assigned goals and IDs visible on a stable line while RPC events update a separate current-activity line. Use `/cancel-worker <id>` to stop one worker without stopping the others.
 - Worker extension UI requests are proxied to the parent UI and parallel dialogs are queued. While a proxied dialog is open, the parent emits `herdr:blocked` so the authoritative TUI integration reports that it is waiting for input.
 - Tool-guard is reused from a parent extension argument or an adjacent `pi-tool-guard` checkout when available. Worker extension discovery stays enabled by default so extension-provided models remain available; set `PI_DELEGATE_TOOL_GUARD_ISOLATE=1` only when duplicate guard discovery is a problem.
 - Read-only workers can be configured with `PI_DELEGATE_TOOLS=read,grep,find,ls`.

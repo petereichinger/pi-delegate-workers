@@ -126,6 +126,7 @@ test("cancels queued and running workers independently", async () => {
   assert.equal(harness.session.getBatch(batch.id).cancelled, 1);
 
   assert.equal(harness.session.cancelWorker(one.id), true);
+  assert.equal(harness.session.cancelWorker(one.id), false);
   assert.equal(harness.deferred.get("one")?.signal.aborted, true);
   harness.deferred.get("one")?.reject(new Error("aborted"));
   await new Promise((resolve) => setImmediate(resolve));
