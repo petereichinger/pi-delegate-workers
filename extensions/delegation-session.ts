@@ -31,6 +31,7 @@ export type DelegationResults<T, R> = {
   batch: DelegationBatchSnapshot<T, R>;
   results: R[];
   timedOut: boolean;
+  interrupted: boolean;
 };
 
 type ManagedTask<T, R> = DelegationTaskSnapshot<T, R> & {
@@ -111,9 +112,12 @@ export class DelegationSession<T, R> {
   ): Promise<DelegationResults<T, R>> {
     const batch = this.#requireBatch(batchId);
     let timedOut = false;
+    let interrupted = false;
 
     if (!this.#waitCondition(batch, waitFor)) {
-      timedOut = await this.#waitForChange(batch, waitFor, options);
+      const waitResult = await this.#waitForChange(batch, waitFor, options);
+      timedOut = waitResult === "timeout";
+      interrupted = waitResult === "interrupted";
     }
 
     const results: R[] = [];
@@ -124,7 +128,7 @@ export class DelegationSession<T, R> {
       }
     }
 
-    return { batch: this.#snapshot(batch), results, timedOut };
+    return { batch: this.#snapshot(batch), results, timedOut, interrupted };
   }
 
   cancelWorker(workerId: string): boolean {
@@ -230,30 +234,26 @@ export class DelegationSession<T, R> {
     batch: Batch<T, R>,
     waitFor: DelegationWaitMode,
     options: { timeoutMs?: number; signal?: AbortSignal },
-  ): Promise<boolean> {
-    if (options.signal?.aborted) return Promise.reject(new Error("Result wait aborted"));
+  ): Promise<"ready" | "timeout" | "interrupted"> {
+    if (options.signal?.aborted) return Promise.resolve("interrupted");
 
-    return new Promise<boolean>((resolve, reject) => {
+    return new Promise((resolve) => {
       let timeout: ReturnType<typeof setTimeout> | undefined;
-      const finish = (timedOut: boolean) => {
+      const finish = (result: "ready" | "timeout" | "interrupted") => {
         batch.waiters.delete(check);
         if (timeout) clearTimeout(timeout);
         options.signal?.removeEventListener("abort", abort);
-        resolve(timedOut);
+        resolve(result);
       };
       const check = () => {
-        if (this.#waitCondition(batch, waitFor) || this.#shuttingDown) finish(false);
+        if (this.#waitCondition(batch, waitFor) || this.#shuttingDown) finish("ready");
       };
-      const abort = () => {
-        batch.waiters.delete(check);
-        if (timeout) clearTimeout(timeout);
-        reject(new Error("Result wait aborted"));
-      };
+      const abort = () => finish("interrupted");
 
       batch.waiters.add(check);
       options.signal?.addEventListener("abort", abort, { once: true });
       if (options.timeoutMs !== undefined) {
-        timeout = setTimeout(() => finish(true), Math.max(0, options.timeoutMs));
+        timeout = setTimeout(() => finish("timeout"), Math.max(0, options.timeoutMs));
       }
       check();
     });

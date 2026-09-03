@@ -513,6 +513,7 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
   const workers = new Map<string, WorkerState>();
   const uiDialogQueue = createRpcUiDialogQueue();
   let sessionContext: ExtensionContext | undefined;
+  let sessionShuttingDown = false;
 
   const reportInputStatus = (active: boolean, label?: string) => {
     pi.events.emit("herdr:blocked", { active, label });
@@ -561,6 +562,13 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
         }
       } else {
         workers.delete(task.id);
+        if (sessionContext?.hasUI && !sessionShuttingDown) {
+          const level = task.state === "completed" ? "info" : "warning";
+          sessionContext.ui.notify(
+            `Delegate ${task.id} ${task.state} in ${task.batchId}; use delegate_results to collect it.`,
+            level,
+          );
+        }
       }
       if (sessionContext) refreshUi(sessionContext, workers);
     },
@@ -584,6 +592,7 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
     .map((task) => task.id);
 
   pi.on("session_start", async (_event, ctx) => {
+    sessionShuttingDown = false;
     sessionContext = ctx;
     refreshUi(ctx, workers);
     delegateConfigLoader.invalidate();
@@ -606,6 +615,7 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
+    sessionShuttingDown = true;
     delegation.shutdown();
     for (const worker of workers.values()) worker.worker?.dispose();
     workers.clear();
@@ -811,6 +821,7 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
         content: [{ type: "text", text: [
           formatBatchStatus(collected.batch),
           `wait_timed_out: ${collected.timedOut}`,
+          `wait_interrupted: ${collected.interrupted}`,
           "New results:",
           resultText,
         ].join("\n\n") }],
@@ -818,6 +829,7 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
           batchId: collected.batch.id,
           resultCount: collected.results.length,
           timedOut: collected.timedOut,
+          interrupted: collected.interrupted,
           terminal: collected.batch.terminal,
         },
       };

@@ -115,6 +115,42 @@ test("next waits for a result and supports timeouts", async () => {
   assert.deepEqual(completed.results.map((result) => result.value), ["one"]);
 });
 
+test("interrupting a result wait does not fail or cancel the worker", async () => {
+  const harness = createHarness(1);
+  const batch = harness.session.createBatch(["one"]);
+  const controller = new AbortController();
+  const pending = harness.session.getResults(batch.id, "all", { signal: controller.signal });
+
+  controller.abort();
+  const interrupted = await pending;
+
+  assert.equal(interrupted.interrupted, true);
+  assert.equal(interrupted.timedOut, false);
+  assert.deepEqual(interrupted.results, []);
+  assert.equal(interrupted.batch.running, 1);
+  assert.equal(harness.deferred.get("one")?.signal.aborted, false);
+
+  await harness.complete("one");
+  const completed = await harness.session.getResults(batch.id, "all");
+  assert.equal(completed.interrupted, false);
+  assert.deepEqual(completed.results.map((result) => result.value), ["one"]);
+});
+
+test("a pre-aborted result wait returns an interrupted snapshot", async () => {
+  const harness = createHarness(1);
+  const batch = harness.session.createBatch(["one"]);
+  const controller = new AbortController();
+  controller.abort();
+
+  const interrupted = await harness.session.getResults(batch.id, "next", {
+    signal: controller.signal,
+  });
+
+  assert.equal(interrupted.interrupted, true);
+  assert.equal(interrupted.batch.running, 1);
+  assert.equal(harness.deferred.get("one")?.signal.aborted, false);
+});
+
 test("cancels queued and running workers independently", async () => {
   const harness = createHarness(1);
   const batch = harness.session.createBatch(["one", "two"]);
