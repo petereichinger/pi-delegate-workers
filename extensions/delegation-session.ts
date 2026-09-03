@@ -142,7 +142,8 @@ export class DelegationSession<T, R> {
       return true;
     }
 
-    task.abortController?.abort();
+    if (!task.abortController || task.abortController.signal.aborted) return false;
+    task.abortController.abort();
     return true;
   }
 

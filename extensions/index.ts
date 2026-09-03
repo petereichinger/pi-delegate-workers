@@ -20,6 +20,12 @@ import {
   type RpcWorker,
 } from "./rpc-worker.ts";
 import {
+  DelegationSession,
+  type DelegationBatchSnapshot,
+  type DelegationTaskState,
+  type DelegationWaitMode,
+} from "./delegation-session.ts";
+import {
   createRpcUiDialogQueue,
   type RpcUiDialogQueue,
 } from "./ui-dialog-queue.ts";
@@ -36,6 +42,10 @@ type RoutedTask = {
   thinkingLevel?: DelegateProfileConfig["thinkingLevel"];
 };
 
+type ScheduledTask = RoutedTask & {
+  sharedContext?: string;
+};
+
 type WorkerState = {
   id: string;
   task: string;
@@ -45,14 +55,13 @@ type WorkerState = {
   status: string;
   latestMessage: string;
   output: string;
-  worker: RpcWorker;
-  abortController: AbortController;
-  cancelRequested: boolean;
+  worker?: RpcWorker;
 };
 
-type WorkerUiState = "starting" | "working" | "synthesizing" | "done" | "cancelled" | "error";
+type WorkerUiState = "queued" | "starting" | "working" | "synthesizing" | "done" | "cancelled" | "error";
 
 const WORKER_STATE_STYLES = {
+  queued: { icon: "", fg: "muted" },
   starting: { icon: "", fg: "muted" },
   working: { icon: "", fg: "accent" },
   synthesizing: { icon: "", fg: "warning" },
@@ -228,7 +237,44 @@ function formatResults(results: DelegatedResult[]): string {
     .join("\n\n---\n\n");
 }
 
+function formatBatchStatus(
+  batch: DelegationBatchSnapshot<ScheduledTask, DelegatedResult>,
+): string {
+  return [
+    `batch: ${batch.id}`,
+    `queued: ${batch.queued}`,
+    `running: ${batch.running}`,
+    `completed: ${batch.completed}`,
+    `failed: ${batch.failed}`,
+    `cancelled: ${batch.cancelled}`,
+    `results_ready: ${batch.undelivered}`,
+    `terminal: ${batch.terminal}`,
+  ].join("\n");
+}
+
+function createTerminalResult(
+  task: ScheduledTask,
+  id: string,
+  output: string,
+  cancelled: boolean,
+): DelegatedResult {
+  return {
+    id,
+    task: task.task,
+    profile: task.profile,
+    model: task.model,
+    thinkingLevel: task.thinkingLevel,
+    ok: false,
+    cancelled,
+    output,
+    rawOutput: output,
+    summaryOutput: output,
+    durationMs: 0,
+  };
+}
+
 function getWorkerUiState(status: string): WorkerUiState {
+  if (status === "queued") return "queued";
   if (status === "synthesizing") return "synthesizing";
   if (status === "done") return "done";
   if (status === "cancelled") return "cancelled";
@@ -289,16 +335,13 @@ async function runTask(
   task: RoutedTask,
   id: string,
   options: {
-    signal?: AbortSignal;
+    signal: AbortSignal;
     sharedContext?: string;
     uiDialogQueue: RpcUiDialogQueue;
     reportInputStatus: (active: boolean, label?: string) => void;
   },
 ): Promise<DelegatedResult> {
-  const abortController = new AbortController();
-  const signal = options.signal
-    ? AbortSignal.any([options.signal, abortController.signal])
-    : abortController.signal;
+  const signal = options.signal;
   const worker = createRpcWorker({
     cwd: ctx.cwd,
     tools: getWorkerTools(),
@@ -319,8 +362,6 @@ async function runTask(
     latestMessage: `Starting: ${task.task}`,
     output: "",
     worker,
-    abortController,
-    cancelRequested: false,
   };
 
   workers.set(id, state);
@@ -444,7 +485,7 @@ async function runTask(
       durationMs: Date.now() - startedAt,
     };
   } catch (error) {
-    const cancelled = state.cancelRequested;
+    const cancelled = signal.aborted;
     const message = cancelled
       ? `Worker ${id} was cancelled.`
       : error instanceof Error ? error.message : String(error);
@@ -471,14 +512,79 @@ async function runTask(
 export default function delegateWorkersExtension(pi: ExtensionAPI) {
   const workers = new Map<string, WorkerState>();
   const uiDialogQueue = createRpcUiDialogQueue();
-  let nextWorkerId = 1;
+  let sessionContext: ExtensionContext | undefined;
 
-  const makeWorkerId = () => `w${nextWorkerId++}`;
   const reportInputStatus = (active: boolean, label?: string) => {
     pi.events.emit("herdr:blocked", { active, label });
   };
 
+  const delegation = new DelegationSession<ScheduledTask, DelegatedResult>({
+    maxWorkers: getMaxWorkers(),
+    runTask: async (task, id, signal) => {
+      if (!sessionContext) throw new Error("Delegate session is not active");
+      return runTask(sessionContext, workers, task, id, {
+        signal,
+        sharedContext: task.sharedContext,
+        uiDialogQueue,
+        reportInputStatus,
+      });
+    },
+    classifyResult: (result) => result.cancelled
+      ? "cancelled"
+      : result.ok ? "completed" : "failed",
+    createCancelledResult: (task, id) =>
+      createTerminalResult(task, id, `Worker ${id} was cancelled.`, true),
+    createFailedResult: (task, id, error) =>
+      createTerminalResult(
+        task,
+        id,
+        error instanceof Error ? error.message : String(error),
+        false,
+      ),
+    onStateChange: (task) => {
+      if (task.state === "queued") {
+        workers.set(task.id, {
+          id: task.id,
+          task: task.task.task,
+          profile: task.task.profile,
+          model: task.task.model,
+          thinkingLevel: task.task.thinkingLevel,
+          status: "queued",
+          latestMessage: "Queued — waiting for a worker slot",
+          output: "",
+        });
+      } else if (task.state === "running") {
+        const state = workers.get(task.id);
+        if (state) {
+          state.status = "starting";
+          state.latestMessage = "Starting worker";
+        }
+      } else {
+        workers.delete(task.id);
+      }
+      if (sessionContext) refreshUi(sessionContext, workers);
+    },
+  });
+
+  const scheduleTasks = async (
+    ctx: ExtensionContext,
+    requestedTasks: TaskRequest[],
+    sharedContext?: string,
+  ): Promise<ScheduledTask[]> => {
+    const loaded = await delegateConfigLoader.load(ctx);
+    return routeTasks(ctx, requestedTasks, loaded.config).map((task) => ({
+      ...task,
+      sharedContext,
+    }));
+  };
+
+  const activeWorkerIds = () => delegation.listBatches()
+    .flatMap((batch) => batch.tasks)
+    .filter((task) => task.state === "queued" || task.state === "running")
+    .map((task) => task.id);
+
   pi.on("session_start", async (_event, ctx) => {
+    sessionContext = ctx;
     refreshUi(ctx, workers);
     delegateConfigLoader.invalidate();
     try {
@@ -500,17 +606,17 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
-    for (const worker of workers.values()) {
-      worker.worker.dispose();
-    }
+    delegation.shutdown();
+    for (const worker of workers.values()) worker.worker?.dispose();
     workers.clear();
+    sessionContext = undefined;
   });
 
   pi.registerCommand("cancel-worker", {
-    description: "Cancel one running delegate worker by ID",
+    description: "Cancel one queued or running delegate worker by ID",
     getArgumentCompletions: (prefix) => {
       const normalizedPrefix = prefix.trim().toLowerCase();
-      const items = [...workers.keys()]
+      const items = activeWorkerIds()
         .filter((id) =>
           id.toLowerCase().startsWith(normalizedPrefix) ||
           id.slice(1).startsWith(normalizedPrefix)
@@ -524,70 +630,44 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
         ctx.ui.notify("Usage: /cancel-worker <worker-id>", "warning");
         return;
       }
-
-      const state = workers.get(id);
-      if (!state || state.cancelRequested) {
-        const active = [...workers.keys()];
+      if (!delegation.cancelWorker(id)) {
+        const active = activeWorkerIds();
         const suffix = active.length > 0
           ? ` Active workers: ${active.join(", ")}.`
           : " No workers are currently running.";
         ctx.ui.notify(`Worker ${id} is not running.${suffix}`, "warning");
         return;
       }
-
-      requestWorkerCancellation(state);
-      state.status = "cancelled";
-      state.latestMessage = "Cancelling";
-      refreshUi(ctx, workers);
       ctx.ui.notify(`Cancelling worker ${id}...`, "info");
     },
   });
 
   pi.registerCommand("delegate", {
-    description:
-      "Delegate parallel tasks using configured worker profiles and synthesize the worker summaries in chat",
+    description: "Start a background delegation batch",
     handler: async (args, ctx) => {
       const requestedTasks = parseCommandTasks(args);
       const maxWorkers = getMaxWorkers();
-
       if (requestedTasks.length === 0) {
-        ctx.ui.notify(
-          "Usage: /delegate [fast] task A | [deep] task B",
-          "warning",
-        );
+        ctx.ui.notify("Usage: /delegate [fast] task A | [deep] task B", "warning");
         return;
       }
-
       if (requestedTasks.length > maxWorkers) {
         ctx.ui.notify(`Too many tasks. Max is ${maxWorkers}.`, "warning");
         return;
       }
 
-      const loaded = await delegateConfigLoader.load(ctx);
-      const tasks = routeTasks(ctx, requestedTasks, loaded.config);
-      ctx.ui.notify(`Launching ${tasks.length} delegate worker(s)...`, "info");
-      const results = await Promise.all(
-        tasks.map((task) =>
-          runTask(ctx, workers, task, makeWorkerId(), {
-            uiDialogQueue,
-            reportInputStatus,
-          }),
-        ),
-      );
-      const combined = formatResults(results);
-      const payload = [
-        {
-          type: "text" as const,
-          text: "I ran delegated workers. Please synthesize their compact per-worker summaries into one answer for me.",
-        },
-        { type: "text" as const, text: combined },
-      ];
-
-      if (ctx.isIdle()) {
-        pi.sendUserMessage(payload);
-      } else {
-        pi.sendUserMessage(payload, { deliverAs: "followUp" });
-      }
+      const tasks = await scheduleTasks(ctx, requestedTasks);
+      const batch = delegation.createBatch(tasks);
+      const payload = [{
+        type: "text" as const,
+        text: [
+          `Delegation batch ${batch.id} started in the background.`,
+          formatBatchStatus(batch),
+          "Continue useful work, collect available results, add follow-up tasks, or wait when appropriate.",
+        ].join("\n\n"),
+      }];
+      if (ctx.isIdle()) pi.sendUserMessage(payload);
+      else pi.sendUserMessage(payload, { deliverAs: "followUp" });
     },
   });
 
@@ -605,14 +685,16 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
     name: "delegate_tasks",
     label: "Delegate Tasks",
     description:
-      "Run multiple focused tasks in parallel using agent-selected configured worker profiles",
+      "Start focused delegated tasks in the background and return batch and worker IDs immediately",
     promptSnippet:
-      "Run independent tasks in parallel and select fast, balanced, or deep worker profiles based on complexity.",
+      "Start independent background tasks with fast, balanced, or deep worker profiles.",
     promptGuidelines: [
-      "Use delegate_tasks for independent subtasks that can run in parallel.",
-      "For delegate_tasks, select profile fast for lookups, searches, summaries, and isolated checks; balanced for multi-file tracing, routine changes, and test diagnosis; deep for architecture, security, migrations, and ambiguous root causes.",
-      "Workers use pi's normal tool set by default (read, write, edit, bash), and can be reconfigured via PI_DELEGATE_TOOLS.",
-      "Only delegate tasks that fit the currently configured worker tool allowlist; use PI_DELEGATE_TOOLS=read,grep,find,ls for read-only workers.",
+      "delegate_tasks returns immediately; use delegate_results to collect completed work or wait when appropriate.",
+      "Continue useful independent work while delegates run, and use delegate_add_tasks for follow-up investigations based on early results.",
+      "Use waitFor available to avoid blocking, next when no other work is useful, and all only when final synthesis requires every result.",
+      "Select fast for lookups and summaries; balanced for routine multi-file work; deep for architecture, security, migrations, or ambiguous root causes.",
+      "Workers share the current working directory; prefer read-only delegation when the parent or other workers may edit overlapping files.",
+      "Workers use pi's normal tool set by default and can be reconfigured with PI_DELEGATE_TOOLS.",
     ],
     parameters: Type.Object({
       tasks: Type.Array(taskSchema, {
@@ -636,51 +718,153 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
         ),
       } as any;
     },
-    async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      const maxWorkers = getMaxWorkers();
-      if (params.tasks.length > maxWorkers) {
-        throw new Error(`Too many tasks. Max is ${maxWorkers}.`);
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const tasks = await scheduleTasks(ctx, params.tasks, params.sharedContext);
+      const batch = delegation.createBatch(tasks);
+      return {
+        content: [{ type: "text", text: [
+          `Started ${batch.id} with ${batch.tasks.length} delegated task(s).`,
+          formatBatchStatus(batch),
+          "Use delegate_results to collect results or delegate_add_tasks to add follow-up work.",
+        ].join("\n\n") }],
+        details: {
+          batchId: batch.id,
+          tasks: batch.tasks.map((task) => ({
+            id: task.id,
+            state: task.state,
+            profile: task.task.profile,
+            model: task.task.model,
+            thinkingLevel: task.task.thinkingLevel,
+          })),
+        },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "delegate_add_tasks",
+    label: "Add Delegate Tasks",
+    description:
+      "Add follow-up tasks to an existing delegation batch while its other workers continue",
+    parameters: Type.Object({
+      batchId: Type.String({ description: "Delegation batch ID, for example b3" }),
+      tasks: Type.Array(taskSchema, {
+        minItems: 1,
+        maxItems: getMaxWorkers(),
+      }),
+      sharedContext: Type.Optional(Type.String({
+        description: "Extra context for only the newly added tasks",
+      })),
+    }),
+    prepareArguments(args) {
+      if (!args || typeof args !== "object" || Array.isArray(args)) return args as any;
+      const input = args as { tasks?: unknown };
+      if (!Array.isArray(input.tasks)) return args as any;
+      return {
+        ...input,
+        tasks: input.tasks.map((task) => typeof task === "string" ? { task } : task),
+      } as any;
+    },
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const tasks = await scheduleTasks(ctx, params.tasks, params.sharedContext);
+      const batch = delegation.addTasks(params.batchId, tasks);
+      return {
+        content: [{ type: "text", text: [
+          `Added ${tasks.length} task(s) to ${batch.id}.`,
+          formatBatchStatus(batch),
+        ].join("\n\n") }],
+        details: {
+          batchId: batch.id,
+          addedTaskIds: batch.tasks.slice(-tasks.length).map((task) => task.id),
+        },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "delegate_results",
+    label: "Delegate Results",
+    description:
+      "Collect new results from a delegation batch, optionally waiting for the next result or all tasks",
+    parameters: Type.Object({
+      batchId: Type.String({ description: "Delegation batch ID, for example b3" }),
+      waitFor: Type.Optional(StringEnum(["available", "next", "all"] as const, {
+        description:
+          "available returns immediately; next waits for one new result; all waits for the terminal batch",
+      })),
+      timeoutMs: Type.Optional(Type.Number({
+        minimum: 0,
+        maximum: 300000,
+        description: "Maximum wait for next/all in milliseconds",
+      })),
+    }),
+    async execute(_toolCallId, params, signal) {
+      const waitFor = (params.waitFor ?? "available") as DelegationWaitMode;
+      const collected = await delegation.getResults(params.batchId, waitFor, {
+        timeoutMs: params.timeoutMs,
+        signal,
+      });
+      const resultText = collected.results.length > 0
+        ? formatResults(collected.results)
+        : "(no new results)";
+      return {
+        content: [{ type: "text", text: [
+          formatBatchStatus(collected.batch),
+          `wait_timed_out: ${collected.timedOut}`,
+          "New results:",
+          resultText,
+        ].join("\n\n") }],
+        details: {
+          batchId: collected.batch.id,
+          resultCount: collected.results.length,
+          timedOut: collected.timedOut,
+          terminal: collected.batch.terminal,
+        },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "delegate_cancel",
+    label: "Cancel Delegation",
+    description: "Cancel one delegated worker or every unfinished worker in a batch",
+    parameters: Type.Object({
+      workerId: Type.Optional(Type.String({ description: "Worker ID to cancel" })),
+      batchId: Type.Optional(Type.String({ description: "Batch ID to cancel" })),
+    }),
+    async execute(_toolCallId, params) {
+      if ((params.workerId ? 1 : 0) + (params.batchId ? 1 : 0) !== 1) {
+        throw new Error("Provide exactly one of workerId or batchId");
+      }
+      if (params.workerId) {
+        const id = normalizeWorkerId(params.workerId);
+        if (!id) throw new Error(`Invalid worker ID: ${params.workerId}`);
+        const cancelled = delegation.cancelWorker(id);
+        return {
+          content: [{
+            type: "text",
+            text: cancelled
+              ? `Cancellation requested for ${id}.`
+              : `${id} is not queued or running.`,
+          }],
+          details: {
+            targetType: "worker",
+            targetId: id,
+            cancelledTasks: cancelled ? 1 : 0,
+          },
+        };
       }
 
-      const loaded = await delegateConfigLoader.load(ctx);
-      const tasks = routeTasks(ctx, params.tasks, loaded.config);
-      onUpdate?.({
-        content: [
-          {
-            type: "text",
-            text: `Launching ${tasks.length} delegate worker(s)...`,
-          },
-        ],
-        details: {},
-      });
-
-      const results = await Promise.all(
-        tasks.map((task) =>
-          runTask(ctx, workers, task, makeWorkerId(), {
-            signal,
-            sharedContext: params.sharedContext,
-            uiDialogQueue,
-            reportInputStatus,
-          }),
-        ),
-      );
-
-      const combined = formatResults(results);
-      const failed = results.filter((result) => !result.ok).length;
-      const cancelled = results.filter((result) => result.cancelled).length;
-
+      const cancelled = delegation.cancelBatch(params.batchId!);
       return {
-        content: [{ type: "text", text: combined }],
+        content: [{
+          type: "text",
+          text: `Cancellation requested for ${cancelled} task(s) in ${params.batchId}.`,
+        }],
         details: {
-          taskCount: results.length,
-          failedTasks: failed,
+          targetType: "batch",
+          targetId: params.batchId!,
           cancelledTasks: cancelled,
-          routes: results.map((result) => ({
-            id: result.id,
-            profile: result.profile,
-            model: result.model,
-            thinkingLevel: result.thinkingLevel,
-          })),
         },
       };
     },
