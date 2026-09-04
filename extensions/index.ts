@@ -401,6 +401,12 @@ async function runTask(
     }
 
     if (event.type === "agent_end") {
+      state.latestMessage = "Finishing worker run";
+      refreshUi(ctx, workers);
+      return;
+    }
+
+    if (event.type === "agent_settled") {
       state.status = "done";
       refreshUi(ctx, workers);
     }
@@ -458,6 +464,12 @@ async function runTask(
           }
 
           if (event.type === "agent_end") {
+            state.latestMessage = "Finishing synthesis";
+            refreshUi(ctx, workers);
+            return;
+          }
+
+          if (event.type === "agent_settled") {
             state.status = "done";
             refreshUi(ctx, workers);
           }
@@ -514,6 +526,8 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
   const uiDialogQueue = createRpcUiDialogQueue();
   let sessionContext: ExtensionContext | undefined;
   let sessionShuttingDown = false;
+  const pendingResultReminders = new Set<string>();
+  const announcedResultReminders = new Set<string>();
 
   const reportInputStatus = (active: boolean, label?: string) => {
     pi.events.emit("herdr:blocked", { active, label });
@@ -562,6 +576,8 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
         }
       } else {
         workers.delete(task.id);
+        pendingResultReminders.add(task.batchId);
+        queueMicrotask(() => flushResultReminder(task.batchId));
         if (sessionContext?.hasUI && !sessionShuttingDown) {
           const level = task.state === "completed" ? "info" : "warning";
           sessionContext.ui.notify(
@@ -573,6 +589,32 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
       if (sessionContext) refreshUi(sessionContext, workers);
     },
   });
+
+  function flushResultReminder(batchId: string): void {
+    const ctx = sessionContext;
+    if (!ctx || sessionShuttingDown || announcedResultReminders.has(batchId)) return;
+
+    const batch = delegation.getBatch(batchId);
+    if (!batch.terminal || batch.undelivered === 0) {
+      pendingResultReminders.delete(batchId);
+      return;
+    }
+    if (!ctx.isIdle()) return;
+
+    pendingResultReminders.delete(batchId);
+    announcedResultReminders.add(batchId);
+    pi.sendMessage({
+      customType: "delegate-results-ready",
+      content: [
+        `Delegation batch ${batch.id} finished with ${batch.undelivered} uncollected result(s).`,
+        `Call delegate_results for ${batch.id} with waitFor available and incorporate the results before replying to the user.`,
+      ].join("\n"),
+      display: true,
+    }, {
+      deliverAs: "followUp",
+      triggerTurn: true,
+    });
+  }
 
   const scheduleTasks = async (
     ctx: ExtensionContext,
@@ -614,8 +656,14 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
     }
   });
 
+  pi.on("agent_settled", async () => {
+    for (const batchId of [...pendingResultReminders]) flushResultReminder(batchId);
+  });
+
   pi.on("session_shutdown", async () => {
     sessionShuttingDown = true;
+    pendingResultReminders.clear();
+    announcedResultReminders.clear();
     delegation.shutdown();
     for (const worker of workers.values()) worker.worker?.dispose();
     workers.clear();
@@ -701,6 +749,8 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
     promptGuidelines: [
       "delegate_tasks returns immediately; use delegate_results to collect completed work or wait when appropriate.",
       "Continue useful independent work while delegates run, and use delegate_add_tasks for follow-up investigations based on early results.",
+      "Before answering the user, collect every result from delegation batches started for that request; use waitFor all when unfinished results matter to the answer.",
+      "If delegate_results reports wait_interrupted with unfinished work, call delegate_results again instead of treating the empty result as completion.",
       "Use waitFor available to avoid blocking, next when no other work is useful, and all only when final synthesis requires every result.",
       "Select fast for lookups and summaries; balanced for routine multi-file work; deep for architecture, security, migrations, or ambiguous root causes.",
       "Workers share the current working directory; prefer read-only delegation when the parent or other workers may edit overlapping files.",
@@ -777,6 +827,8 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
     },
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const tasks = await scheduleTasks(ctx, params.tasks, params.sharedContext);
+      announcedResultReminders.delete(params.batchId);
+      pendingResultReminders.delete(params.batchId);
       const batch = delegation.addTasks(params.batchId, tasks);
       return {
         content: [{ type: "text", text: [
@@ -814,14 +866,23 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
         timeoutMs: params.timeoutMs,
         signal,
       });
+      if (collected.batch.undelivered === 0) {
+        pendingResultReminders.delete(params.batchId);
+      }
       const resultText = collected.results.length > 0
         ? formatResults(collected.results)
         : "(no new results)";
+      const nextAction = collected.interrupted && !collected.batch.terminal
+        ? "Wait was interrupted while delegates are unfinished. Call delegate_results again to collect them before replying."
+        : collected.timedOut && !collected.batch.terminal
+          ? "Wait timed out while delegates are unfinished. Continue useful work or call delegate_results again."
+          : undefined;
       return {
         content: [{ type: "text", text: [
           formatBatchStatus(collected.batch),
           `wait_timed_out: ${collected.timedOut}`,
           `wait_interrupted: ${collected.interrupted}`,
+          ...(nextAction ? [`next_action: ${nextAction}`] : []),
           "New results:",
           resultText,
         ].join("\n\n") }],

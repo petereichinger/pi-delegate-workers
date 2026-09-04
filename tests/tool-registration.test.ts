@@ -14,6 +14,7 @@ test("registers non-blocking delegation lifecycle tools", () => {
     registerTool(tool: any) {
       tools.set(tool.name, tool);
     },
+    sendMessage() {},
     sendUserMessage() {},
   } as any;
 
@@ -26,6 +27,9 @@ test("registers non-blocking delegation lifecycle tools", () => {
     "delegate_cancel",
   ]);
   assert.match(tools.get("delegate_tasks").description, /background/);
+  assert.ok(tools.get("delegate_tasks").promptGuidelines.some(
+    (guideline: string) => /Before answering the user, collect every result/.test(guideline),
+  ));
   assert.match(tools.get("delegate_results").description, /next result or all tasks/);
   assert.match(commands.get("delegate").description, /background/);
   assert.match(commands.get("cancel-worker").description, /queued or running/);

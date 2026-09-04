@@ -7,6 +7,10 @@ import type { RpcUiDialogQueue } from "./ui-dialog-queue.ts";
 
 export type RpcEvent = any;
 
+export function isRpcPromptSettled(event: RpcEvent): boolean {
+  return event?.type === "agent_settled";
+}
+
 export type RpcWorker = {
   prompt(
     message: string,
@@ -31,6 +35,7 @@ type RpcUi = {
 type ActivePrompt = {
   id: string;
   text: string;
+  agentStarts: number;
   onEvent?: (event: RpcEvent) => void;
   resolve: (value: { text: string }) => void;
   reject: (error: Error) => void;
@@ -324,6 +329,12 @@ export function createRpcWorker(options: {
 
     activePrompt.onEvent?.(event);
 
+    if (event.type === "agent_start") {
+      if (activePrompt.agentStarts > 0) activePrompt.text = "";
+      activePrompt.agentStarts++;
+      return;
+    }
+
     if (
       event.type === "message_update" &&
       event.assistantMessageEvent?.type === "text_delta"
@@ -341,7 +352,7 @@ export function createRpcWorker(options: {
       return;
     }
 
-    if (event.type === "agent_end") {
+    if (isRpcPromptSettled(event)) {
       const resolve = activePrompt.resolve;
       const text = activePrompt.text;
       activePrompt.cleanup();
@@ -409,6 +420,7 @@ export function createRpcWorker(options: {
         activePrompt = {
           id,
           text: "",
+          agentStarts: 0,
           onEvent: options.onEvent,
           resolve,
           reject,
