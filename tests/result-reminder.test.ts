@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { shouldSendResultReminder } from "../extensions/index.ts";
+import {
+  deferUntilAfterAgentSettled,
+  shouldSendResultReminder,
+} from "../extensions/index.ts";
 
 const availableResult = { undelivered: 1 };
 const baseOptions = {
@@ -8,7 +11,6 @@ const baseOptions = {
   alreadyAnnounced: false,
   activelyCollecting: false,
   parentIdle: true,
-  force: false,
 };
 
 test("wakes an idle parent for any uncollected result", () => {
@@ -22,19 +24,21 @@ test("coalesces completions while the parent is active", () => {
   }), false);
 });
 
-test("flushes a pending completion when the parent settles", () => {
-  assert.equal(shouldSendResultReminder(availableResult, {
-    ...baseOptions,
-    parentIdle: false,
-    force: true,
-  }), true);
+test("defers reminder work beyond the agent_settled handler", async () => {
+  let called = false;
+  deferUntilAfterAgentSettled(() => {
+    called = true;
+  });
+
+  assert.equal(called, false);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(called, true);
 });
 
 test("defers reminders while the parent is already collecting the batch", () => {
   assert.equal(shouldSendResultReminder(availableResult, {
     ...baseOptions,
     activelyCollecting: true,
-    force: true,
   }), false);
 });
 

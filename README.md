@@ -133,7 +133,7 @@ The parent chooses whether to inspect completed work immediately or wait:
 
 `next` and `all` accept an optional `timeoutMs` up to 300000. If the parent turn is interrupted while waiting, the call returns the current snapshot with `wait_interrupted: true`; it does not fail the turn or cancel background workers, and explicitly tells the parent to collect again. Results are delivered once, in completion order. Every response also reports queued, running, completed, failed, cancelled, and ready-result counts.
 
-Before replying to the user, the parent is instructed to collect every result from batches started for that request. Worker completions are coalesced while the parent is active. If the parent settles with an uncollected result—or a result arrives while it is idle—the extension injects one model-visible follow-up reminder and starts another turn. Collecting the available results rearms this wake-up behavior for later completions.
+Before replying to the user, the parent is instructed to collect every result from batches started for that request. Worker completions are coalesced while the parent is active. If the parent settles with an uncollected result—or a result arrives while it is idle—the extension injects one model-visible follow-up reminder and starts another turn. Reminder turns are deferred until the settled event has fully unwound so Pi installs the new run's cancellation handling correctly. Collecting the available results rearms this wake-up behavior for later completions.
 
 ### Add follow-up work
 

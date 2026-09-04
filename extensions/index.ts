@@ -244,14 +244,17 @@ export function shouldSendResultReminder(
     alreadyAnnounced: boolean;
     activelyCollecting: boolean;
     parentIdle: boolean;
-    force: boolean;
   },
 ): boolean {
   return !options.sessionShuttingDown &&
     !options.alreadyAnnounced &&
     !options.activelyCollecting &&
-    (options.parentIdle || options.force) &&
+    options.parentIdle &&
     batch.undelivered > 0;
+}
+
+export function deferUntilAfterAgentSettled(callback: () => void): void {
+  setTimeout(callback, 0);
 }
 
 function formatBatchStatus(
@@ -595,7 +598,7 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
       } else {
         workers.delete(task.id);
         pendingResultReminders.add(task.batchId);
-        queueMicrotask(() => flushResultReminder(task.batchId));
+        deferUntilAfterAgentSettled(() => flushResultReminder(task.batchId));
         if (sessionContext?.hasUI && !sessionShuttingDown) {
           const level = task.state === "completed" ? "info" : "warning";
           sessionContext.ui.notify(
@@ -608,7 +611,7 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
     },
   });
 
-  function flushResultReminder(batchId: string, force = false): void {
+  function flushResultReminder(batchId: string): void {
     const ctx = sessionContext;
     if (!ctx) return;
 
@@ -622,7 +625,6 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
       alreadyAnnounced: announcedResultReminders.has(batchId),
       activelyCollecting: (activeResultCollections.get(batchId) ?? 0) > 0,
       parentIdle: ctx.isIdle(),
-      force,
     })) return;
 
     pendingResultReminders.delete(batchId);
@@ -699,7 +701,11 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
   });
 
   pi.on("agent_settled", async () => {
-    for (const batchId of [...pendingResultReminders]) flushResultReminder(batchId, true);
+    // Starting a turn reentrantly from agent_settled can leave Pi between runs,
+    // showing "Working" without installing the new run's Escape handler.
+    deferUntilAfterAgentSettled(() => {
+      for (const batchId of [...pendingResultReminders]) flushResultReminder(batchId);
+    });
   });
 
   pi.on("session_shutdown", async () => {
@@ -953,7 +959,7 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
         pendingResultReminders.delete(params.batchId);
         announcedResultReminders.delete(params.batchId);
       } else {
-        queueMicrotask(() => flushResultReminder(params.batchId));
+        deferUntilAfterAgentSettled(() => flushResultReminder(params.batchId));
       }
       const resultText = collected.results.length > 0
         ? formatResults(collected.results)
