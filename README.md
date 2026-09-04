@@ -8,7 +8,7 @@ It launches separate `pi --mode rpc` worker processes, runs configured tasks thr
 
 - `/delegate [fast] task A | [deep] task B` starts a background batch
 - `/cancel-worker 13` cancels a queued or running worker shown as `w13` (the `w13` form is also accepted)
-- `delegate_tasks` starts a batch and returns immediately
+- `delegate_tasks` starts a batch and returns the first completed result
 - `delegate_results` collects available results or waits for the next/all results
 - `delegate_add_tasks` adds adaptive follow-up work while existing workers continue
 - `delegate_cancel` cancels a worker or batch from the parent agent
@@ -102,7 +102,7 @@ Set a property to `null` to clear an inherited value and use pi's startup defaul
 
 ### Start a batch
 
-`delegate_tasks` uses structured tasks and always returns immediately with a batch ID and worker IDs:
+`delegate_tasks` uses structured tasks, starts every worker, and waits for the first completed result:
 
 ```json
 {
@@ -115,7 +115,9 @@ Set a property to `null` to clear an inherited value and use pi's startup defaul
 }
 ```
 
-The profile is optional and falls back to `defaultProfile`. Legacy calls containing string tasks are normalized automatically. Starting a batch does not wait for summaries.
+The first return includes every result that became available at that completion boundary plus the current batch status. The parent can then evaluate the findings, add follow-up tasks, or explicitly wait for the next/all remaining results. The profile is optional and falls back to `defaultProfile`. Legacy calls containing string tasks are normalized automatically.
+
+Use `"background": true` only when detached execution is intentional. Background mode returns immediately with the batch and worker IDs and no initial results.
 
 ### Collect results
 
@@ -131,7 +133,7 @@ The parent chooses whether to inspect completed work immediately or wait:
 
 `next` and `all` accept an optional `timeoutMs` up to 300000. If the parent turn is interrupted while waiting, the call returns the current snapshot with `wait_interrupted: true`; it does not fail the turn or cancel background workers, and explicitly tells the parent to collect again. Results are delivered once, in completion order. Every response also reports queued, running, completed, failed, cancelled, and ready-result counts.
 
-Before replying to the user, the parent is instructed to collect every result from batches started for that request. If a batch finishes after the parent becomes idle and still has uncollected results, the extension injects one model-visible follow-up reminder and starts a turn so completed background work is not silently abandoned.
+Before replying to the user, the parent is instructed to collect every result from batches started for that request. Worker completions are coalesced while the parent is active. If the parent settles with an uncollected result—or a result arrives while it is idle—the extension injects one model-visible follow-up reminder and starts another turn. Collecting the available results rearms this wake-up behavior for later completions.
 
 ### Add follow-up work
 
@@ -187,7 +189,7 @@ When a resolved profile controls the model or thinking level, conflicting `--pro
 
 - Workers run in the same CWD as the main session. Background write-enabled workers can conflict with the parent or each other; prefer `PI_DELEGATE_TOOLS=read,grep,find,ls` for exploratory batches.
 - Batches and result delivery live for the current session. Session shutdown cancels queued and running work.
-- The live parent widget keeps queued/running workers' assigned goals and IDs visible on a stable line while RPC events update a separate current-activity line. A notification announces each terminal worker, and a terminal batch with uncollected results wakes an idle parent once. Use `/cancel-worker <id>` to stop one worker without stopping the others.
+- The live parent widget keeps queued/running workers' assigned goals and IDs visible on a stable line while RPC events update a separate current-activity line. A notification announces each terminal worker, and newly available uncollected results wake a settled parent once per collection cycle. Use `/cancel-worker <id>` to stop one worker without stopping the others.
 - RPC worker prompts complete on `agent_settled`, not the earlier low-level `agent_end`, so automatic retries, compaction retries, and queued continuations finish before investigation or synthesis output is accepted.
 - Worker extension UI requests are proxied to the parent UI and parallel dialogs are queued. While a proxied dialog is open, the parent emits `herdr:blocked` so the authoritative TUI integration reports that it is waiting for input.
 - Tool-guard is reused from a parent extension argument or an adjacent `pi-tool-guard` checkout when available. Worker extension discovery stays enabled by default so extension-provided models remain available; set `PI_DELEGATE_TOOL_GUARD_ISOLATE=1` only when duplicate guard discovery is a problem.

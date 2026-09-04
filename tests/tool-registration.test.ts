@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import delegateWorkersExtension from "../extensions/index.ts";
 
-test("registers non-blocking delegation lifecycle tools", () => {
+test("registers delegation lifecycle tools", () => {
   const tools = new Map<string, any>();
   const commands = new Map<string, any>();
   const pi = {
@@ -26,7 +26,8 @@ test("registers non-blocking delegation lifecycle tools", () => {
     "delegate_results",
     "delegate_cancel",
   ]);
-  assert.match(tools.get("delegate_tasks").description, /background/);
+  assert.match(tools.get("delegate_tasks").description, /wait for the first result/);
+  assert.ok(tools.get("delegate_tasks").parameters.properties.background);
   assert.ok(tools.get("delegate_tasks").promptGuidelines.some(
     (guideline: string) => /Before answering the user, collect every result/.test(guideline),
   ));

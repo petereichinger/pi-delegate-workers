@@ -237,6 +237,23 @@ function formatResults(results: DelegatedResult[]): string {
     .join("\n\n---\n\n");
 }
 
+export function shouldSendResultReminder(
+  batch: Pick<DelegationBatchSnapshot<unknown, unknown>, "undelivered">,
+  options: {
+    sessionShuttingDown: boolean;
+    alreadyAnnounced: boolean;
+    activelyCollecting: boolean;
+    parentIdle: boolean;
+    force: boolean;
+  },
+): boolean {
+  return !options.sessionShuttingDown &&
+    !options.alreadyAnnounced &&
+    !options.activelyCollecting &&
+    (options.parentIdle || options.force) &&
+    batch.undelivered > 0;
+}
+
 function formatBatchStatus(
   batch: DelegationBatchSnapshot<ScheduledTask, DelegatedResult>,
 ): string {
@@ -528,6 +545,7 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
   let sessionShuttingDown = false;
   const pendingResultReminders = new Set<string>();
   const announcedResultReminders = new Set<string>();
+  const activeResultCollections = new Map<string, number>();
 
   const reportInputStatus = (active: boolean, label?: string) => {
     pi.events.emit("herdr:blocked", { active, label });
@@ -581,7 +599,7 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
         if (sessionContext?.hasUI && !sessionShuttingDown) {
           const level = task.state === "completed" ? "info" : "warning";
           sessionContext.ui.notify(
-            `Delegate ${task.id} ${task.state} in ${task.batchId}; use delegate_results to collect it.`,
+            `Delegate ${task.id} ${task.state} in ${task.batchId}.`,
             level,
           );
         }
@@ -590,23 +608,29 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
     },
   });
 
-  function flushResultReminder(batchId: string): void {
+  function flushResultReminder(batchId: string, force = false): void {
     const ctx = sessionContext;
-    if (!ctx || sessionShuttingDown || announcedResultReminders.has(batchId)) return;
+    if (!ctx) return;
 
     const batch = delegation.getBatch(batchId);
-    if (!batch.terminal || batch.undelivered === 0) {
+    if (batch.undelivered === 0) {
       pendingResultReminders.delete(batchId);
       return;
     }
-    if (!ctx.isIdle()) return;
+    if (!shouldSendResultReminder(batch, {
+      sessionShuttingDown,
+      alreadyAnnounced: announcedResultReminders.has(batchId),
+      activelyCollecting: (activeResultCollections.get(batchId) ?? 0) > 0,
+      parentIdle: ctx.isIdle(),
+      force,
+    })) return;
 
     pendingResultReminders.delete(batchId);
     announcedResultReminders.add(batchId);
     pi.sendMessage({
       customType: "delegate-results-ready",
       content: [
-        `Delegation batch ${batch.id} finished with ${batch.undelivered} uncollected result(s).`,
+        `Delegation batch ${batch.id} has ${batch.undelivered} new uncollected result(s).`,
         `Call delegate_results for ${batch.id} with waitFor available and incorporate the results before replying to the user.`,
       ].join("\n"),
       display: true,
@@ -614,6 +638,24 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
       deliverAs: "followUp",
       triggerTurn: true,
     });
+  }
+
+  async function collectResults(
+    batchId: string,
+    waitFor: DelegationWaitMode,
+    options: { timeoutMs?: number; signal?: AbortSignal } = {},
+  ) {
+    activeResultCollections.set(
+      batchId,
+      (activeResultCollections.get(batchId) ?? 0) + 1,
+    );
+    try {
+      return await delegation.getResults(batchId, waitFor, options);
+    } finally {
+      const remaining = (activeResultCollections.get(batchId) ?? 1) - 1;
+      if (remaining > 0) activeResultCollections.set(batchId, remaining);
+      else activeResultCollections.delete(batchId);
+    }
   }
 
   const scheduleTasks = async (
@@ -657,13 +699,14 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
   });
 
   pi.on("agent_settled", async () => {
-    for (const batchId of [...pendingResultReminders]) flushResultReminder(batchId);
+    for (const batchId of [...pendingResultReminders]) flushResultReminder(batchId, true);
   });
 
   pi.on("session_shutdown", async () => {
     sessionShuttingDown = true;
     pendingResultReminders.clear();
     announcedResultReminders.clear();
+    activeResultCollections.clear();
     delegation.shutdown();
     for (const worker of workers.values()) worker.worker?.dispose();
     workers.clear();
@@ -743,11 +786,11 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
     name: "delegate_tasks",
     label: "Delegate Tasks",
     description:
-      "Start focused delegated tasks in the background and return batch and worker IDs immediately",
+      "Start focused delegated tasks and wait for the first result unless background mode is requested",
     promptSnippet:
-      "Start independent background tasks with fast, balanced, or deep worker profiles.",
+      "Start independent tasks with fast, balanced, or deep worker profiles and receive the first completed result.",
     promptGuidelines: [
-      "delegate_tasks returns immediately; use delegate_results to collect completed work or wait when appropriate.",
+      "delegate_tasks waits for the first completed result by default; use background only when immediate detached execution is genuinely needed.",
       "Continue useful independent work while delegates run, and use delegate_add_tasks for follow-up investigations based on early results.",
       "Before answering the user, collect every result from delegation batches started for that request; use waitFor all when unfinished results matter to the answer.",
       "If delegate_results reports wait_interrupted with unfinished work, call delegate_results again instead of treating the empty result as completion.",
@@ -766,6 +809,11 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
           description: "Extra context to prepend to each worker task",
         }),
       ),
+      background: Type.Optional(
+        Type.Boolean({
+          description: "Return immediately instead of waiting for the first completed result",
+        }),
+      ),
     }),
     prepareArguments(args) {
       if (!args || typeof args !== "object" || Array.isArray(args)) return args as any;
@@ -778,18 +826,53 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
         ),
       } as any;
     },
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const tasks = await scheduleTasks(ctx, params.tasks, params.sharedContext);
-      const batch = delegation.createBatch(tasks);
+      const started = delegation.createBatch(tasks);
+      if (params.background) {
+        return {
+          content: [{ type: "text", text: [
+            `Started ${started.id} with ${started.tasks.length} delegated task(s) in background mode.`,
+            formatBatchStatus(started),
+            "Use delegate_results to collect results or delegate_add_tasks to add follow-up work.",
+          ].join("\n\n") }],
+          details: {
+            batchId: started.id,
+            resultCount: 0,
+            interrupted: false,
+            tasks: started.tasks.map((task) => ({
+              id: task.id,
+              state: task.state,
+              profile: task.task.profile,
+              model: task.task.model,
+              thinkingLevel: task.task.thinkingLevel,
+            })),
+          },
+        };
+      }
+
+      const collected = await collectResults(started.id, "next", { signal });
+      if (collected.batch.undelivered === 0) {
+        pendingResultReminders.delete(started.id);
+        announcedResultReminders.delete(started.id);
+      }
+      const resultText = collected.results.length > 0
+        ? formatResults(collected.results)
+        : "(no result before the wait was interrupted)";
       return {
         content: [{ type: "text", text: [
-          `Started ${batch.id} with ${batch.tasks.length} delegated task(s).`,
-          formatBatchStatus(batch),
-          "Use delegate_results to collect results or delegate_add_tasks to add follow-up work.",
+          `Started ${started.id} with ${started.tasks.length} delegated task(s).`,
+          formatBatchStatus(collected.batch),
+          `wait_interrupted: ${collected.interrupted}`,
+          "First available results:",
+          resultText,
+          "Evaluate these results, then use delegate_results with next/all or delegate_add_tasks as appropriate.",
         ].join("\n\n") }],
         details: {
-          batchId: batch.id,
-          tasks: batch.tasks.map((task) => ({
+          batchId: started.id,
+          resultCount: collected.results.length,
+          interrupted: collected.interrupted,
+          tasks: collected.batch.tasks.map((task) => ({
             id: task.id,
             state: task.state,
             profile: task.task.profile,
@@ -862,12 +945,15 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
     }),
     async execute(_toolCallId, params, signal) {
       const waitFor = (params.waitFor ?? "available") as DelegationWaitMode;
-      const collected = await delegation.getResults(params.batchId, waitFor, {
+      const collected = await collectResults(params.batchId, waitFor, {
         timeoutMs: params.timeoutMs,
         signal,
       });
       if (collected.batch.undelivered === 0) {
         pendingResultReminders.delete(params.batchId);
+        announcedResultReminders.delete(params.batchId);
+      } else {
+        queueMicrotask(() => flushResultReminder(params.batchId));
       }
       const resultText = collected.results.length > 0
         ? formatResults(collected.results)
