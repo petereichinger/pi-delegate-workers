@@ -1,19 +1,19 @@
 # pi-delegate-workers
 
-A local pi package that adds a `/delegate` command and a `delegate_tasks` tool.
+A local pi package that adds a `delegate_tasks` tool for model-directed delegation.
 
 It launches separate `pi --mode rpc` worker processes, runs configured tasks in parallel, asks each worker to synthesize its own findings, and returns compact summaries to the main session.
 
 ## What it does
 
-- `/delegate [fast] task A | [deep] task B`
-- `/cancel-worker 13` to cancel the running worker shown as `w13` in the live widget (the `w13` form is also accepted)
 - `delegate_tasks` with parent-agent-selected `fast`, `balanced`, or `deep` profiles
+- `/cancel-worker 13` to cancel the running worker shown as `w13` in the live widget (the `w13` form is also accepted)
 - per-profile model and thinking level configuration
 - global, Git-repository, and current-directory JSON configuration
 - live per-worker widget with a stable goal line and changing current activity
 - progress text and current tool activity streamed from each worker over RPC
 - per-worker synthesis before returning results to the parent
+- worker token and cost usage added to the parent session totals
 - normal pi worker tool set by default (`read,write,edit,bash`)
 
 The parent agent selects profiles using this rubric:
@@ -117,7 +117,7 @@ Each worker starts with the resolved profile on its command line:
 pi --mode rpc --no-session --model provider/model --thinking medium --tools ...
 ```
 
-The same model and thinking level are used for investigation and the worker's synthesis pass.
+The same model and thinking level are used for investigation and the worker's synthesis pass. Usage from both passes, nested worker tools, and worker compaction is aggregated into the `delegate_tasks` tool result. Pi includes it in the parent session footer, `/session`, and RPC session totals.
 
 ## Environment settings
 

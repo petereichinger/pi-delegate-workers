@@ -1,6 +1,7 @@
 import {
   getSupportedThinkingLevels,
   StringEnum,
+  type Usage,
 } from "@earendil-works/pi-ai";
 import type {
   ExtensionAPI,
@@ -16,6 +17,7 @@ import {
 } from "./config.ts";
 import {
   createRpcWorker,
+  sumUsage,
   type RpcEvent,
   type RpcWorker,
 } from "./rpc-worker.ts";
@@ -73,6 +75,7 @@ type DelegatedResult = {
   rawOutput: string;
   summaryOutput: string;
   durationMs: number;
+  usage: Usage;
 };
 
 const DEFAULT_TOOLS = ["read", "write", "edit", "bash"];
@@ -108,20 +111,6 @@ export function requestWorkerCancellation(state: {
   state.cancelRequested = true;
   state.abortController.abort();
   return true;
-}
-
-export function parseCommandTasks(text: string): TaskRequest[] {
-  return text
-    .split("|")
-    .map((part) => part.trim())
-    .filter(Boolean)
-    .map((part) => {
-      const match = part.match(/^\[(fast|balanced|deep)\]\s*(.*)$/s);
-      return match
-        ? { task: match[2]!.trim(), profile: match[1] as ProfileName }
-        : { task: part };
-    })
-    .filter((task) => task.task.length > 0);
 }
 
 export function routeTasks(
@@ -442,6 +431,7 @@ async function runTask(
       rawOutput: investigation.text,
       summaryOutput: summaryText,
       durationMs: Date.now() - startedAt,
+      usage: worker.getUsage(),
     };
   } catch (error) {
     const cancelled = state.cancelRequested;
@@ -460,6 +450,7 @@ async function runTask(
       rawOutput: message,
       summaryOutput: message,
       durationMs: Date.now() - startedAt,
+      usage: worker.getUsage(),
     };
   } finally {
     worker.dispose();
@@ -543,54 +534,6 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
     },
   });
 
-  pi.registerCommand("delegate", {
-    description:
-      "Delegate parallel tasks using configured worker profiles and synthesize the worker summaries in chat",
-    handler: async (args, ctx) => {
-      const requestedTasks = parseCommandTasks(args);
-      const maxWorkers = getMaxWorkers();
-
-      if (requestedTasks.length === 0) {
-        ctx.ui.notify(
-          "Usage: /delegate [fast] task A | [deep] task B",
-          "warning",
-        );
-        return;
-      }
-
-      if (requestedTasks.length > maxWorkers) {
-        ctx.ui.notify(`Too many tasks. Max is ${maxWorkers}.`, "warning");
-        return;
-      }
-
-      const loaded = await delegateConfigLoader.load(ctx);
-      const tasks = routeTasks(ctx, requestedTasks, loaded.config);
-      ctx.ui.notify(`Launching ${tasks.length} delegate worker(s)...`, "info");
-      const results = await Promise.all(
-        tasks.map((task) =>
-          runTask(ctx, workers, task, makeWorkerId(), {
-            uiDialogQueue,
-            reportInputStatus,
-          }),
-        ),
-      );
-      const combined = formatResults(results);
-      const payload = [
-        {
-          type: "text" as const,
-          text: "I ran delegated workers. Please synthesize their compact per-worker summaries into one answer for me.",
-        },
-        { type: "text" as const, text: combined },
-      ];
-
-      if (ctx.isIdle()) {
-        pi.sendUserMessage(payload);
-      } else {
-        pi.sendUserMessage(payload, { deliverAs: "followUp" });
-      }
-    },
-  });
-
   const taskSchema = Type.Object({
     task: Type.String({ description: "Focused task for one delegated worker" }),
     profile: Type.Optional(
@@ -668,9 +611,11 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
       const combined = formatResults(results);
       const failed = results.filter((result) => !result.ok).length;
       const cancelled = results.filter((result) => result.cancelled).length;
+      const usage = sumUsage(results.map((result) => result.usage));
 
       return {
         content: [{ type: "text", text: combined }],
+        usage,
         details: {
           taskCount: results.length,
           failedTasks: failed,
@@ -680,6 +625,7 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
             profile: result.profile,
             model: result.model,
             thinkingLevel: result.thinkingLevel,
+            usage: result.usage,
           })),
         },
       };

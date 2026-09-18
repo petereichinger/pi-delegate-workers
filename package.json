@@ -1,6 +1,6 @@
 {
   "name": "pi-delegate-workers",
-  "version": "0.7.1",
+  "version": "0.10.0",
   "private": true,
   "description": "Pi extension that delegates configured tasks to parallel pi RPC workers.",
   "keywords": [
@@ -17,15 +17,15 @@
     ]
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "^0.81.1",
-    "@earendil-works/pi-coding-agent": "*",
-    "typebox": "*"
+    "@earendil-works/pi-ai": "^0.85.1",
+    "@earendil-works/pi-coding-agent": "^0.85.1",
+    "typebox": "^1.3.33"
   },
   "dependencies": {
     "pi-scoped-config": "git+https://github.com/petereichinger/pi-scoped-config.git#v0.1.1"
   },
   "devDependencies": {
-    "@types/node": "^26.1.1",
+    "@types/node": "^26.6.1",
     "typescript": "^7.0.2"
   }
 }

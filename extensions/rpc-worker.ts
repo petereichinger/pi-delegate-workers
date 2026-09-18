@@ -2,6 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { Usage } from "@earendil-works/pi-ai";
 import type { ThinkingLevel } from "./config.ts";
 import type { RpcUiDialogQueue } from "./ui-dialog-queue.ts";
 
@@ -12,9 +13,65 @@ export type RpcWorker = {
     message: string,
     options?: { onEvent?: (event: RpcEvent) => void; signal?: AbortSignal }
   ): Promise<{ text: string }>;
+  getUsage(): Usage;
   abort(): void;
   dispose(): void;
 };
+
+export function emptyUsage(): Usage {
+  return {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    cost: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      total: 0,
+    },
+  };
+}
+
+export function addUsage(left: Usage, right: Usage): Usage {
+  const usage: Usage = {
+    input: left.input + right.input,
+    output: left.output + right.output,
+    cacheRead: left.cacheRead + right.cacheRead,
+    cacheWrite: left.cacheWrite + right.cacheWrite,
+    totalTokens: left.totalTokens + right.totalTokens,
+    cost: {
+      input: left.cost.input + right.cost.input,
+      output: left.cost.output + right.cost.output,
+      cacheRead: left.cost.cacheRead + right.cost.cacheRead,
+      cacheWrite: left.cost.cacheWrite + right.cost.cacheWrite,
+      total: left.cost.total + right.cost.total,
+    },
+  };
+
+  if (left.cacheWrite1h !== undefined || right.cacheWrite1h !== undefined) {
+    usage.cacheWrite1h = (left.cacheWrite1h ?? 0) + (right.cacheWrite1h ?? 0);
+  }
+  if (left.reasoning !== undefined || right.reasoning !== undefined) {
+    usage.reasoning = (left.reasoning ?? 0) + (right.reasoning ?? 0);
+  }
+
+  return usage;
+}
+
+export function sumUsage(usages: Iterable<Usage>): Usage {
+  let total = emptyUsage();
+  for (const usage of usages) total = addUsage(total, usage);
+  return total;
+}
+
+export function getRpcEventUsage(event: RpcEvent): Usage | undefined {
+  if (event.type === "message_end") return event.message?.usage;
+  if (event.type === "compaction_end") return event.result?.usage;
+  return undefined;
+}
 
 type RpcUi = {
   select?: (title: string, options: string[], optionsArg?: any) => Promise<string | undefined>;
@@ -217,6 +274,7 @@ export function createRpcWorker(options: {
   let disposed = false;
   let stderr = "";
   let activePrompt: ActivePrompt | undefined;
+  let usage = emptyUsage();
 
   proc.stderr.on("data", (chunk) => {
     stderr += chunk.toString("utf8");
@@ -310,6 +368,9 @@ export function createRpcWorker(options: {
   };
 
   parseJsonl(proc, (event) => {
+    const eventUsage = getRpcEventUsage(event);
+    if (eventUsage) usage = addUsage(usage, eventUsage);
+
     if (event.type === "extension_ui_request") {
       const receivedAt = Date.now();
       const handleRequest = () => handleUiRequest(event, receivedAt);
@@ -341,7 +402,7 @@ export function createRpcWorker(options: {
       return;
     }
 
-    if (event.type === "agent_end") {
+    if (event.type === "agent_settled") {
       const resolve = activePrompt.resolve;
       const text = activePrompt.text;
       activePrompt.cleanup();
@@ -427,6 +488,10 @@ export function createRpcWorker(options: {
           reject(error instanceof Error ? error : new Error(String(error)));
         }
       });
+    },
+
+    getUsage() {
+      return addUsage(emptyUsage(), usage);
     },
 
     abort() {

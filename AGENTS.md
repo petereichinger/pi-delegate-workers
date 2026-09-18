@@ -2,7 +2,7 @@
 
 ## Project overview
 
-`pi-delegate-workers` is a TypeScript pi package that delegates tasks to parallel `pi --mode rpc` worker processes. It provides the `/delegate` command and the `delegate_tasks` tool, supports `fast`, `balanced`, and `deep` worker profiles, and merges global, repository, and directory-scoped configuration.
+`pi-delegate-workers` is a TypeScript pi package that delegates tasks to parallel `pi --mode rpc` worker processes. It provides the `delegate_tasks` tool, supports `fast`, `balanced`, and `deep` worker profiles, and merges global, repository, and directory-scoped configuration.
 
 ## Repository layout
 

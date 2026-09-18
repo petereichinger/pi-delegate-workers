@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   normalizeWorkerId,
-  parseCommandTasks,
   requestWorkerCancellation,
   routeTasks,
 } from "../extensions/index.ts";
@@ -63,17 +62,6 @@ test("cancels a worker only once", () => {
   assert.equal(state.cancelRequested, true);
   assert.equal(abortController.signal.aborted, true);
   assert.equal(requestWorkerCancellation(state), false);
-});
-
-test("parses optional slash-command profile annotations", () => {
-  assert.deepEqual(
-    parseCommandTasks("[fast] locate config | inspect tests | [deep] review migration"),
-    [
-      { task: "locate config", profile: "fast" },
-      { task: "inspect tests" },
-      { task: "review migration", profile: "deep" },
-    ],
-  );
 });
 
 test("routes tasks through explicit and default profiles", () => {
