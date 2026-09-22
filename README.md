@@ -9,6 +9,8 @@ It launches separate `pi --mode rpc` worker processes, runs configured tasks in 
 - `delegate_tasks` with parent-agent-selected `fast`, `balanced`, or `deep` profiles
 - `/cancel-worker 13` to cancel the running worker shown as `w13` in the live widget (the `w13` form is also accepted)
 - per-profile model and thinking level configuration
+- automatic model-set selection from the active parent model
+- per-task model-set overrides for aligned or cross-model delegation
 - global, Git-repository, and current-directory JSON configuration
 - live per-worker widget with a stable goal line and changing current activity
 - progress text and current tool activity streamed from each worker over RPC
@@ -52,22 +54,53 @@ All files are optional. They are deeply merged in this order:
   "defaultProfile": "balanced",
   "profiles": {
     "fast": {
-      "model": "provider/small-model",
       "thinkingLevel": "low"
     },
     "balanced": {
-      "model": "provider/standard-model",
       "thinkingLevel": "medium"
     },
     "deep": {
-      "model": "provider/strong-model",
       "thinkingLevel": "high"
     }
-  }
+  },
+  "defaultModelSet": "diverse",
+  "modelSets": {
+    "claude": {
+      "profiles": {
+        "fast": { "model": "anthropic/claude-haiku" },
+        "balanced": { "model": "anthropic/claude-sonnet" },
+        "deep": { "model": "anthropic/claude-opus" }
+      }
+    },
+    "diverse": {
+      "profiles": {
+        "fast": { "model": "provider/astra" },
+        "balanced": { "model": "provider/sol" },
+        "deep": { "model": "provider/sol" }
+      }
+    }
+  },
+  "parentModelRoutes": [
+    {
+      "models": ["anthropic/claude-*"],
+      "modelSet": "claude"
+    }
+  ]
 }
 ```
 
-Valid thinking levels are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. Models must use an exact `provider/model` identifier. The extension resolves configured models through pi's model registry and verifies model-specific thinking-level support before spawning workers.
+Valid thinking levels are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. Models must use an exact `provider/model` identifier. Parent model routes use minimatch-compatible `provider/model` patterns and the first matching route wins. The extension resolves configured worker models through pi's model registry and verifies model-specific thinking-level support before spawning workers.
+
+Model sets overlay the top-level profiles. In the example, each set supplies worker models while the top-level profiles supply shared thinking levels. Existing configurations without model sets keep their current behavior.
+
+For each task, model-set selection uses this precedence:
+
+1. The task's explicit `modelSet`
+2. The first `parentModelRoutes` match for the active parent model
+3. `defaultModelSet`
+4. The top-level profile without a model set
+
+Switching the active parent model updates automatic routing immediately. A transient message shows the initial configured model set and any later effective set change; configurations that use only baseline profiles do not add a startup message or persistent status item.
 
 A narrower scope can override one property while inheriting the rest:
 
@@ -81,7 +114,7 @@ A narrower scope can override one property while inheriting the rest:
 }
 ```
 
-Set a property to `null` to clear an inherited value and use pi's startup default:
+Set a profile property to `null` to clear an inherited value and use pi's startup default:
 
 ```json
 {
@@ -94,6 +127,8 @@ Set a property to `null` to clear an inherited value and use pi's startup defaul
 }
 ```
 
+Named model sets are deeply merged across scopes. Set a model-set entry to `null` to remove it, or set `defaultModelSet` to `null` to clear the inherited default. `parentModelRoutes` is ordered, so a narrower scope replaces the complete inherited route list; set it to `null` to clear all inherited routes.
+
 ## Tool usage
 
 The current tool schema uses structured tasks:
@@ -103,13 +138,18 @@ The current tool schema uses structured tasks:
   "tasks": [
     { "task": "Locate the auth middleware", "profile": "fast" },
     { "task": "Trace token refresh failures", "profile": "balanced" },
-    { "task": "Review migration safety", "profile": "deep" }
+    { "task": "Review migration safety", "profile": "deep" },
+    {
+      "task": "Run an independent cross-model review",
+      "profile": "deep",
+      "modelSet": "diverse"
+    }
   ],
   "sharedContext": "Optional context shared by every worker"
 }
 ```
 
-The profile is optional and falls back to `defaultProfile`. Legacy calls containing string tasks are normalized automatically.
+The profile is optional and falls back to `defaultProfile`. Omit `modelSet` to infer it from the active parent model. An explicit task model set overrides automatic routing only for that task. Legacy calls containing string tasks are normalized automatically.
 
 Each worker starts with the resolved profile on its command line:
 

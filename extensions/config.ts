@@ -19,16 +19,31 @@ export type DelegateProfileConfig = {
   thinkingLevel?: ThinkingLevel | null;
 };
 
+export type DelegateModelSetConfig = {
+  profiles?: Partial<Record<ProfileName, DelegateProfileConfig>>;
+};
+
+export type ParentModelRoute = {
+  models: string[];
+  modelSet: string;
+};
+
 export type DelegateConfig = {
   version?: 1;
   defaultProfile?: ProfileName;
   profiles?: Partial<Record<ProfileName, DelegateProfileConfig>>;
+  defaultModelSet?: string | null;
+  modelSets?: Record<string, DelegateModelSetConfig | null>;
+  parentModelRoutes?: ParentModelRoute[] | null;
 };
 
 export type ResolvedDelegateConfig = {
   version: 1;
   defaultProfile: ProfileName;
   profiles: Record<ProfileName, DelegateProfileConfig>;
+  defaultModelSet?: string;
+  modelSets: Record<string, DelegateModelSetConfig>;
+  parentModelRoutes: ParentModelRoute[];
 };
 
 export type LoadedDelegateConfig = {
@@ -43,14 +58,99 @@ export type LoadedDelegateConfig = {
 
 const PROFILE_NAME_SET = new Set<string>(PROFILE_NAMES);
 const THINKING_LEVEL_SET = new Set<string>(THINKING_LEVELS);
-const ROOT_FIELDS = new Set(["version", "defaultProfile", "profiles"]);
+const ROOT_FIELDS = new Set([
+  "version",
+  "defaultProfile",
+  "profiles",
+  "defaultModelSet",
+  "modelSets",
+  "parentModelRoutes",
+]);
 const PROFILE_FIELDS = new Set(["model", "thinkingLevel"]);
+const MODEL_SET_FIELDS = new Set(["profiles"]);
+const ROUTE_FIELDS = new Set(["models", "modelSet"]);
+const MODEL_SET_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const MODEL_PATTERN = /^[^/\s]+\/[^/\s][^\s]*$/;
 
 function objectValue(value: unknown, label: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new TypeError(`${label} must be an object`);
   }
   return value as Record<string, unknown>;
+}
+
+function decodeProfile(
+  rawProfile: unknown,
+  label: string,
+  warnings: string[],
+): DelegateProfileConfig {
+  const profile = objectValue(rawProfile, label);
+  for (const field of Object.keys(profile)) {
+    if (!PROFILE_FIELDS.has(field)) {
+      warnings.push(`unknown ${label} field ignored: ${field}`);
+    }
+  }
+
+  const decoded: DelegateProfileConfig = {};
+  if (profile.model !== undefined) {
+    if (profile.model === null) {
+      decoded.model = null;
+    } else if (
+      typeof profile.model === "string" &&
+      MODEL_PATTERN.test(profile.model)
+    ) {
+      decoded.model = profile.model;
+    } else {
+      throw new TypeError(`${label}.model must be null or a provider/model string`);
+    }
+  }
+
+  if (profile.thinkingLevel !== undefined) {
+    if (profile.thinkingLevel === null) {
+      decoded.thinkingLevel = null;
+    } else if (
+      typeof profile.thinkingLevel === "string" &&
+      THINKING_LEVEL_SET.has(profile.thinkingLevel)
+    ) {
+      decoded.thinkingLevel = profile.thinkingLevel as ThinkingLevel;
+    } else {
+      throw new TypeError(
+        `${label}.thinkingLevel must be null or one of: ${THINKING_LEVELS.join(", ")}`,
+      );
+    }
+  }
+
+  return decoded;
+}
+
+function decodeProfiles(
+  rawProfiles: unknown,
+  label: string,
+  warnings: string[],
+): Partial<Record<ProfileName, DelegateProfileConfig>> {
+  const profiles = objectValue(rawProfiles, label);
+  const decoded: Partial<Record<ProfileName, DelegateProfileConfig>> = {};
+  for (const [name, rawProfile] of Object.entries(profiles)) {
+    if (!PROFILE_NAME_SET.has(name)) {
+      warnings.push(`unknown ${label} profile ignored: ${name}`);
+      continue;
+    }
+    decoded[name as ProfileName] = decodeProfile(
+      rawProfile,
+      `${label}.${name}`,
+      warnings,
+    );
+  }
+  return decoded;
+}
+
+function decodeModelSetName(value: unknown, label: string): string {
+  if (typeof value !== "string" || !MODEL_SET_NAME_PATTERN.test(value)) {
+    throw new TypeError(
+      `${label} must start with an alphanumeric character and contain only alphanumeric characters, dots, underscores, or hyphens`,
+    );
+  }
+  return value;
 }
 
 export function decodeDelegateConfig(value: unknown): {
@@ -81,57 +181,95 @@ export function decodeDelegateConfig(value: unknown): {
   }
 
   if (root.profiles !== undefined) {
-    const profiles = objectValue(root.profiles, "profiles");
-    config.profiles = {};
-    for (const [name, rawProfile] of Object.entries(profiles)) {
-      if (!PROFILE_NAME_SET.has(name)) {
-        warnings.push(`unknown profile ignored: ${name}`);
+    config.profiles = decodeProfiles(root.profiles, "profiles", warnings);
+  }
+
+  if (root.defaultModelSet !== undefined) {
+    config.defaultModelSet = root.defaultModelSet === null
+      ? null
+      : decodeModelSetName(root.defaultModelSet, "defaultModelSet");
+  }
+
+  if (root.modelSets !== undefined) {
+    const modelSets = objectValue(root.modelSets, "modelSets");
+    config.modelSets = {};
+    for (const [name, rawModelSet] of Object.entries(modelSets)) {
+      decodeModelSetName(name, `modelSets key ${JSON.stringify(name)}`);
+      if (rawModelSet === null) {
+        config.modelSets[name] = null;
         continue;
       }
 
-      const profile = objectValue(rawProfile, `profiles.${name}`);
-      for (const field of Object.keys(profile)) {
-        if (!PROFILE_FIELDS.has(field)) {
-          warnings.push(`unknown profiles.${name} field ignored: ${field}`);
+      const modelSet = objectValue(rawModelSet, `modelSets.${name}`);
+      for (const field of Object.keys(modelSet)) {
+        if (!MODEL_SET_FIELDS.has(field)) {
+          warnings.push(`unknown modelSets.${name} field ignored: ${field}`);
         }
       }
+      config.modelSets[name] = {
+        ...(modelSet.profiles === undefined
+          ? {}
+          : {
+              profiles: decodeProfiles(
+                modelSet.profiles,
+                `modelSets.${name}.profiles`,
+                warnings,
+              ),
+            }),
+      };
+    }
+  }
 
-      const decoded: DelegateProfileConfig = {};
-      if (profile.model !== undefined) {
-        if (profile.model === null) {
-          decoded.model = null;
-        } else if (
-          typeof profile.model === "string" &&
-          /^[^/\s]+\/[^/\s][^\s]*$/.test(profile.model)
-        ) {
-          decoded.model = profile.model;
-        } else {
-          throw new TypeError(
-            `profiles.${name}.model must be null or a provider/model string`,
-          );
-        }
+  if (root.parentModelRoutes !== undefined) {
+    if (root.parentModelRoutes === null) {
+      config.parentModelRoutes = null;
+    } else {
+      if (!Array.isArray(root.parentModelRoutes)) {
+        throw new TypeError("parentModelRoutes must be null or an array");
       }
-
-      if (profile.thinkingLevel !== undefined) {
-        if (profile.thinkingLevel === null) {
-          decoded.thinkingLevel = null;
-        } else if (
-          typeof profile.thinkingLevel === "string" &&
-          THINKING_LEVEL_SET.has(profile.thinkingLevel)
-        ) {
-          decoded.thinkingLevel = profile.thinkingLevel as ThinkingLevel;
-        } else {
-          throw new TypeError(
-            `profiles.${name}.thinkingLevel must be null or one of: ${THINKING_LEVELS.join(", ")}`,
-          );
+      config.parentModelRoutes = root.parentModelRoutes.map((rawRoute, index) => {
+        const label = `parentModelRoutes[${index}]`;
+        const route = objectValue(rawRoute, label);
+        for (const field of Object.keys(route)) {
+          if (!ROUTE_FIELDS.has(field)) {
+            warnings.push(`unknown ${label} field ignored: ${field}`);
+          }
         }
-      }
-
-      config.profiles[name as ProfileName] = decoded;
+        if (!Array.isArray(route.models) || route.models.length === 0) {
+          throw new TypeError(`${label}.models must be a non-empty array`);
+        }
+        const models = route.models.map((pattern, patternIndex) => {
+          if (typeof pattern !== "string" || !MODEL_PATTERN.test(pattern)) {
+            throw new TypeError(
+              `${label}.models[${patternIndex}] must be a provider/model pattern`,
+            );
+          }
+          return pattern;
+        });
+        return {
+          models,
+          modelSet: decodeModelSetName(route.modelSet, `${label}.modelSet`),
+        };
+      });
     }
   }
 
   return { value: config, warnings };
+}
+
+function mergeProfiles(
+  target: Partial<Record<ProfileName, DelegateProfileConfig>>,
+  source: Partial<Record<ProfileName, DelegateProfileConfig>> | undefined,
+): void {
+  for (const profileName of PROFILE_NAMES) {
+    const profile = source?.[profileName];
+    if (!profile) continue;
+    const targetProfile = target[profileName] ??= {};
+    if (Object.hasOwn(profile, "model")) targetProfile.model = profile.model;
+    if (Object.hasOwn(profile, "thinkingLevel")) {
+      targetProfile.thinkingLevel = profile.thinkingLevel;
+    }
+  }
 }
 
 export function mergeDelegateConfigs(
@@ -145,20 +283,56 @@ export function mergeDelegateConfigs(
       balanced: {},
       deep: {},
     },
+    modelSets: {},
+    parentModelRoutes: [],
   };
 
   for (const config of configs) {
     if (!config) continue;
     if (config.defaultProfile) merged.defaultProfile = config.defaultProfile;
-    for (const profileName of PROFILE_NAMES) {
-      const profile = config.profiles?.[profileName];
-      if (!profile) continue;
-      if (Object.hasOwn(profile, "model")) {
-        merged.profiles[profileName].model = profile.model;
+    mergeProfiles(merged.profiles, config.profiles);
+
+    if (Object.hasOwn(config, "defaultModelSet")) {
+      if (config.defaultModelSet === null) delete merged.defaultModelSet;
+      else merged.defaultModelSet = config.defaultModelSet;
+    }
+
+    for (const [name, modelSet] of Object.entries(config.modelSets ?? {})) {
+      if (modelSet === null) {
+        delete merged.modelSets[name];
+        continue;
       }
-      if (Object.hasOwn(profile, "thinkingLevel")) {
-        merged.profiles[profileName].thinkingLevel = profile.thinkingLevel;
+      let target = Object.hasOwn(merged.modelSets, name)
+        ? merged.modelSets[name]
+        : undefined;
+      if (!target) {
+        target = {};
+        merged.modelSets[name] = target;
       }
+      if (modelSet.profiles) {
+        target.profiles ??= {};
+        mergeProfiles(target.profiles, modelSet.profiles);
+      }
+    }
+
+    if (Object.hasOwn(config, "parentModelRoutes")) {
+      merged.parentModelRoutes = config.parentModelRoutes ?? [];
+    }
+  }
+
+  if (
+    merged.defaultModelSet !== undefined &&
+    !Object.hasOwn(merged.modelSets, merged.defaultModelSet)
+  ) {
+    throw new TypeError(
+      `defaultModelSet references unknown model set: ${merged.defaultModelSet}`,
+    );
+  }
+  for (const [index, route] of merged.parentModelRoutes.entries()) {
+    if (!Object.hasOwn(merged.modelSets, route.modelSet)) {
+      throw new TypeError(
+        `parentModelRoutes[${index}] references unknown model set: ${route.modelSet}`,
+      );
     }
   }
 

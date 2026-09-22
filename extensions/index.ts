@@ -3,6 +3,7 @@ import {
   StringEnum,
   type Usage,
 } from "@earendil-works/pi-ai";
+import { minimatch } from "minimatch";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -29,11 +30,16 @@ import {
 type TaskRequest = {
   task: string;
   profile?: ProfileName;
+  modelSet?: string;
 };
+
+type ModelSetSource = "task" | "parent-model" | "default" | "none";
 
 type RoutedTask = {
   task: string;
   profile: ProfileName;
+  modelSet?: string;
+  modelSetSource: ModelSetSource;
   model?: string | null;
   thinkingLevel?: DelegateProfileConfig["thinkingLevel"];
 };
@@ -42,6 +48,7 @@ type WorkerState = {
   id: string;
   task: string;
   profile: ProfileName;
+  modelSet?: string;
   model?: string | null;
   thinkingLevel?: DelegateProfileConfig["thinkingLevel"];
   status: string;
@@ -67,6 +74,8 @@ type DelegatedResult = {
   id: string;
   task: string;
   profile: ProfileName;
+  modelSet?: string;
+  modelSetSource: ModelSetSource;
   model?: string | null;
   thinkingLevel?: DelegateProfileConfig["thinkingLevel"];
   ok: boolean;
@@ -113,6 +122,36 @@ export function requestWorkerCancellation(state: {
   return true;
 }
 
+export function selectAutomaticModelSet(
+  model: { provider: string; id: string } | undefined,
+  config: ResolvedDelegateConfig,
+): { modelSet?: string; source: Exclude<ModelSetSource, "task"> } {
+  if (model) {
+    const modelId = `${model.provider}/${model.id}`;
+    for (const route of config.parentModelRoutes) {
+      if (route.models.some((pattern) => minimatch(modelId, pattern))) {
+        return { modelSet: route.modelSet, source: "parent-model" };
+      }
+    }
+  }
+  return config.defaultModelSet === undefined
+    ? { source: "none" }
+    : { modelSet: config.defaultModelSet, source: "default" };
+}
+
+export function formatModelSetNotification(
+  previous: string | undefined,
+  next: string | undefined,
+  initialized: boolean,
+): string | undefined {
+  const nextLabel = next ?? "baseline";
+  if (!initialized) {
+    return next === undefined ? undefined : `Delegate model set: ${nextLabel}`;
+  }
+  if (previous === next) return undefined;
+  return `Delegate model set changed: ${previous ?? "baseline"} → ${nextLabel}`;
+}
+
 export function routeTasks(
   ctx: ExtensionContext,
   tasks: TaskRequest[],
@@ -120,10 +159,27 @@ export function routeTasks(
 ): RoutedTask[] {
   return tasks.map((request) => {
     const profile = request.profile ?? config.defaultProfile;
-    const profileConfig = config.profiles[profile];
+    const automatic = selectAutomaticModelSet(ctx.model, config);
+    const modelSet = request.modelSet ?? automatic.modelSet;
+    const modelSetSource: ModelSetSource = request.modelSet === undefined
+      ? automatic.source
+      : "task";
+    if (modelSet !== undefined && !Object.hasOwn(config.modelSets, modelSet)) {
+      const available = Object.keys(config.modelSets);
+      throw new Error(
+        `delegate-workers task model set not found: ${modelSet}; available: ${available.join(", ") || "none"}`,
+      );
+    }
+
+    const profileConfig = {
+      ...config.profiles[profile],
+      ...config.modelSets[modelSet ?? ""]?.profiles?.[profile],
+    };
     const routed: RoutedTask = {
       task: request.task,
       profile,
+      ...(modelSet === undefined ? {} : { modelSet }),
+      modelSetSource,
       ...profileConfig,
     };
 
@@ -207,6 +263,8 @@ function formatResults(results: DelegatedResult[]): string {
         "",
         `status: ${status}`,
         `profile: ${result.profile}`,
+        `model_set: ${result.modelSet ?? "baseline"}`,
+        `model_set_source: ${result.modelSetSource}`,
         `model: ${configuredValue(result.model)}`,
         `thinking: ${configuredValue(result.thinkingLevel)}`,
         `duration_ms: ${result.durationMs}`,
@@ -302,6 +360,7 @@ async function runTask(
     id,
     task: task.task,
     profile: task.profile,
+    modelSet: task.modelSet,
     model: task.model,
     thinkingLevel: task.thinkingLevel,
     status: "starting",
@@ -358,6 +417,8 @@ async function runTask(
     id,
     task: task.task,
     profile: task.profile,
+    modelSet: task.modelSet,
+    modelSetSource: task.modelSetSource,
     model: task.model,
     thinkingLevel: task.thinkingLevel,
   };
@@ -463,10 +524,27 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
   const workers = new Map<string, WorkerState>();
   const uiDialogQueue = createRpcUiDialogQueue();
   let nextWorkerId = 1;
+  let inferredModelSetInitialized = false;
+  let inferredModelSet: string | undefined;
 
   const makeWorkerId = () => `w${nextWorkerId++}`;
   const reportInputStatus = (active: boolean, label?: string) => {
     pi.events.emit("herdr:blocked", { active, label });
+  };
+  const notifyModelSet = (
+    ctx: ExtensionContext,
+    config: ResolvedDelegateConfig,
+    model: { provider: string; id: string } | undefined,
+  ) => {
+    const next = selectAutomaticModelSet(model, config).modelSet;
+    const message = formatModelSetNotification(
+      inferredModelSet,
+      next,
+      inferredModelSetInitialized,
+    );
+    inferredModelSetInitialized = true;
+    inferredModelSet = next;
+    if (message && ctx.hasUI) ctx.ui.notify(message, "info");
   };
 
   pi.on("session_start", async (_event, ctx) => {
@@ -474,12 +552,27 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
     delegateConfigLoader.invalidate();
     try {
       const loaded = await delegateConfigLoader.load(ctx);
+      notifyModelSet(ctx, loaded.config, ctx.model);
       if (loaded.warnings.length > 0 && ctx.hasUI) {
         ctx.ui.notify(
           `delegate-workers config warnings:\n${loaded.warnings.join("\n")}`,
           "warning",
         );
       }
+    } catch (error) {
+      if (ctx.hasUI) {
+        ctx.ui.notify(
+          error instanceof Error ? error.message : String(error),
+          "error",
+        );
+      }
+    }
+  });
+
+  pi.on("model_select", async (event, ctx) => {
+    try {
+      const loaded = await delegateConfigLoader.load(ctx);
+      notifyModelSet(ctx, loaded.config, event.model);
     } catch (error) {
       if (ctx.hasUI) {
         ctx.ui.notify(
@@ -542,6 +635,12 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
           "fast for lookups and summaries; balanced for routine multi-file work; deep for architecture, security, migrations, or ambiguous root causes",
       }),
     ),
+    modelSet: Type.Optional(
+      Type.String({
+        description:
+          "Configured model set override; omit to infer it from the current parent model",
+      }),
+    ),
   });
 
   pi.registerTool({
@@ -554,6 +653,7 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
     promptGuidelines: [
       "Use delegate_tasks for independent subtasks that can run in parallel.",
       "For delegate_tasks, select profile fast for lookups, searches, summaries, and isolated checks; balanced for multi-file tracing, routine changes, and test diagnosis; deep for architecture, security, migrations, and ambiguous root causes.",
+      "For delegate_tasks, omit modelSet to infer it from the current parent model; set modelSet only when the user requests a configured routing override or an independent model family.",
       "Workers use pi's normal tool set by default (read, write, edit, bash), and can be reconfigured via PI_DELEGATE_TOOLS.",
       "Only delegate tasks that fit the currently configured worker tool allowlist; use PI_DELEGATE_TOOLS=read,grep,find,ls for read-only workers.",
     ],
@@ -623,6 +723,8 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
           routes: results.map((result) => ({
             id: result.id,
             profile: result.profile,
+            modelSet: result.modelSet,
+            modelSetSource: result.modelSetSource,
             model: result.model,
             thinkingLevel: result.thinkingLevel,
             usage: result.usage,

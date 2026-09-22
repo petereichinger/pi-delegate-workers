@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  formatModelSetNotification,
   normalizeWorkerId,
   requestWorkerCancellation,
   routeTasks,
+  selectAutomaticModelSet,
 } from "../extensions/index.ts";
 import type { ResolvedDelegateConfig } from "../extensions/config.ts";
 
@@ -15,6 +17,8 @@ const config: ResolvedDelegateConfig = {
     balanced: {},
     deep: { model: "test/large", thinkingLevel: "max" },
   },
+  modelSets: {},
+  parentModelRoutes: [],
 };
 
 function contextWithModels() {
@@ -38,6 +42,7 @@ function contextWithModels() {
     ],
   ]);
   return {
+    model: undefined,
     modelRegistry: {
       find(provider: string, id: string) {
         return models.get(`${provider}/${id}`);
@@ -45,6 +50,29 @@ function contextWithModels() {
     },
   } as any;
 }
+
+test("formats model set notifications only for initial configured selection and changes", () => {
+  assert.equal(
+    formatModelSetNotification(undefined, undefined, false),
+    undefined,
+  );
+  assert.equal(
+    formatModelSetNotification(undefined, "claude", false),
+    "Delegate model set: claude",
+  );
+  assert.equal(
+    formatModelSetNotification("claude", "claude", true),
+    undefined,
+  );
+  assert.equal(
+    formatModelSetNotification("claude", "diverse", true),
+    "Delegate model set changed: claude → diverse",
+  );
+  assert.equal(
+    formatModelSetNotification("claude", undefined, true),
+    "Delegate model set changed: claude → baseline",
+  );
+});
 
 test("normalizes numeric and prefixed worker IDs", () => {
   assert.equal(normalizeWorkerId("13"), "w13");
@@ -79,13 +107,15 @@ test("routes tasks through explicit and default profiles", () => {
     {
       task: "lookup",
       profile: "fast",
+      modelSetSource: "none",
       model: "test/small",
       thinkingLevel: "low",
     },
-    { task: "routine", profile: "balanced" },
+    { task: "routine", profile: "balanced", modelSetSource: "none" },
     {
       task: "architecture",
       profile: "deep",
+      modelSetSource: "none",
       model: "test/large",
       thinkingLevel: "max",
     },
@@ -109,5 +139,109 @@ test("rejects model-specific unsupported thinking levels before spawn", () => {
         invalid,
       ),
     /does not support thinking level max/,
+  );
+});
+
+test("selects a model set from the current parent model before the default", () => {
+  const routedConfig: ResolvedDelegateConfig = {
+    ...config,
+    defaultModelSet: "diverse",
+    modelSets: {
+      claude: { profiles: { fast: { model: "test/large", thinkingLevel: "max" } } },
+      diverse: { profiles: { fast: { thinkingLevel: "medium" } } },
+    },
+    parentModelRoutes: [
+      { models: ["anthropic/claude-*"], modelSet: "claude" },
+      { models: ["anthropic/*"], modelSet: "diverse" },
+    ],
+  };
+
+  assert.deepEqual(
+    selectAutomaticModelSet(
+      { provider: "anthropic", id: "claude-sonnet" },
+      routedConfig,
+    ),
+    { modelSet: "claude", source: "parent-model" },
+  );
+  assert.deepEqual(
+    selectAutomaticModelSet({ provider: "other", id: "model" }, routedConfig),
+    { modelSet: "diverse", source: "default" },
+  );
+
+  const ctx = contextWithModels();
+  ctx.model = { provider: "anthropic", id: "claude-sonnet" };
+  assert.deepEqual(
+    routeTasks(ctx, [{ task: "review", profile: "fast" }], routedConfig),
+    [{
+      task: "review",
+      profile: "fast",
+      modelSet: "claude",
+      modelSetSource: "parent-model",
+      model: "test/large",
+      thinkingLevel: "max",
+    }],
+  );
+});
+
+test("task model set overrides automatic routing and overlays the baseline profile", () => {
+  const routedConfig: ResolvedDelegateConfig = {
+    ...config,
+    defaultModelSet: "claude",
+    modelSets: {
+      claude: { profiles: { fast: { model: "test/large" } } },
+      diverse: { profiles: { fast: { thinkingLevel: "medium" } } },
+    },
+  };
+
+  assert.deepEqual(
+    routeTasks(
+      contextWithModels(),
+      [{ task: "independent review", profile: "fast", modelSet: "diverse" }],
+      routedConfig,
+    ),
+    [{
+      task: "independent review",
+      profile: "fast",
+      modelSet: "diverse",
+      modelSetSource: "task",
+      model: "test/small",
+      thinkingLevel: "medium",
+    }],
+  );
+  assert.throws(
+    () => routeTasks(
+      contextWithModels(),
+      [{ task: "review", modelSet: "missing" }],
+      routedConfig,
+    ),
+    /model set not found: missing; available: claude, diverse/,
+  );
+});
+
+test("model-set null values clear baseline worker routing", () => {
+  const routedConfig: ResolvedDelegateConfig = {
+    ...config,
+    defaultModelSet: "startup-defaults",
+    modelSets: {
+      "startup-defaults": {
+        profiles: { fast: { model: null, thinkingLevel: null } },
+      },
+    },
+  };
+
+  assert.deepEqual(
+    routeTasks(
+      contextWithModels(),
+      [{ task: "use startup defaults", profile: "fast" }],
+      routedConfig,
+    ),
+    [{
+      task: "use startup defaults",
+      profile: "fast",
+      modelSet: "startup-defaults",
+      modelSetSource: "default",
+      model: null,
+      thinkingLevel: null,
+    }],
   );
 });

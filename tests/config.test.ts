@@ -38,6 +38,86 @@ test("decodes and deeply merges profile overrides including null clears", () => 
   });
 });
 
+test("merges model sets, replaces routes, and supports inherited clears", () => {
+  const global = decodeDelegateConfig({
+    profiles: { deep: { thinkingLevel: "high" } },
+    defaultModelSet: "claude",
+    modelSets: {
+      claude: { profiles: { deep: { model: "anthropic/sonnet" } } },
+      diverse: { profiles: { deep: { model: "openai/reviewer" } } },
+    },
+    parentModelRoutes: [
+      { models: ["anthropic/claude-*"], modelSet: "claude" },
+    ],
+  }).value;
+  const repo = decodeDelegateConfig({
+    modelSets: {
+      claude: { profiles: { deep: { thinkingLevel: "max" } } },
+    },
+    parentModelRoutes: [
+      { models: ["openrouter/claude-*"], modelSet: "claude" },
+    ],
+  }).value;
+
+  const merged = mergeDelegateConfigs([global, repo]);
+  assert.equal(merged.defaultModelSet, "claude");
+  assert.deepEqual(merged.modelSets.claude, {
+    profiles: {
+      deep: { model: "anthropic/sonnet", thinkingLevel: "max" },
+    },
+  });
+  assert.deepEqual(merged.parentModelRoutes, [
+    { models: ["openrouter/claude-*"], modelSet: "claude" },
+  ]);
+
+  const cleared = mergeDelegateConfigs([
+    global,
+    decodeDelegateConfig({
+      defaultModelSet: null,
+      modelSets: { diverse: null },
+      parentModelRoutes: null,
+    }).value,
+  ]);
+  assert.equal(cleared.defaultModelSet, undefined);
+  assert.equal(cleared.modelSets.diverse, undefined);
+  assert.deepEqual(cleared.parentModelRoutes, []);
+});
+
+test("supports model-set names that overlap Object prototype properties", () => {
+  const merged = mergeDelegateConfigs([
+    decodeDelegateConfig({
+      defaultModelSet: "constructor",
+      modelSets: {
+        constructor: {
+          profiles: { fast: { model: "test/small" } },
+        },
+      },
+    }).value,
+  ]);
+
+  assert.equal(merged.defaultModelSet, "constructor");
+  assert.deepEqual(merged.modelSets.constructor, {
+    profiles: { fast: { model: "test/small" } },
+  });
+});
+
+test("rejects model set references that do not exist after merging", () => {
+  assert.throws(
+    () => mergeDelegateConfigs([
+      decodeDelegateConfig({ defaultModelSet: "missing" }).value,
+    ]),
+    /defaultModelSet references unknown model set: missing/,
+  );
+  assert.throws(
+    () => mergeDelegateConfigs([
+      decodeDelegateConfig({
+        parentModelRoutes: [{ models: ["anthropic/*"], modelSet: "missing" }],
+      }).value,
+    ]),
+    /parentModelRoutes\[0\] references unknown model set: missing/,
+  );
+});
+
 test("rejects invalid models and thinking levels", () => {
   for (const model of ["bare-id", "provider//model", "provider/model with-space", "provider/model\nextra"]) {
     assert.throws(
@@ -51,6 +131,16 @@ test("rejects invalid models and thinking levels", () => {
         profiles: { fast: { thinkingLevel: "extreme" } },
       }),
     /thinkingLevel/,
+  );
+  assert.throws(
+    () => decodeDelegateConfig({ modelSets: { "bad name": {} } }),
+    /modelSets key/,
+  );
+  assert.throws(
+    () => decodeDelegateConfig({
+      parentModelRoutes: [{ models: ["bare-model"], modelSet: "claude" }],
+    }),
+    /provider\/model pattern/,
   );
 });
 
