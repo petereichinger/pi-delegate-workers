@@ -544,7 +544,9 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
     );
     inferredModelSetInitialized = true;
     inferredModelSet = next;
-    if (message && ctx.hasUI) ctx.ui.notify(message, "info");
+    if (message && ctx.hasUI) {
+      setTimeout(() => ctx.ui.notify(message, "info"), 0);
+    }
   };
 
   pi.on("session_start", async (_event, ctx) => {
