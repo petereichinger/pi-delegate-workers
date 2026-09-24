@@ -149,7 +149,7 @@ The current tool schema uses structured tasks:
 }
 ```
 
-The profile is optional and falls back to `defaultProfile`. Omit `modelSet` to infer it from the active parent model. An explicit task model set overrides automatic routing only for that task. Legacy calls containing string tasks are normalized automatically.
+The profile is optional and falls back to `defaultProfile`. Leave `modelSet` out to infer it from the active parent model. Empty or whitespace-only values also use automatic routing. A non-empty task model set overrides automatic routing only for that task; unknown names are rejected. Legacy calls containing string tasks are normalized automatically.
 
 Each worker starts with the resolved profile on its command line:
 

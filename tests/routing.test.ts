@@ -170,17 +170,19 @@ test("selects a model set from the current parent model before the default", () 
 
   const ctx = contextWithModels();
   ctx.model = { provider: "anthropic", id: "claude-sonnet" };
-  assert.deepEqual(
-    routeTasks(ctx, [{ task: "review", profile: "fast" }], routedConfig),
-    [{
-      task: "review",
-      profile: "fast",
-      modelSet: "claude",
-      modelSetSource: "parent-model",
-      model: "test/large",
-      thinkingLevel: "max",
-    }],
-  );
+  for (const modelSet of [undefined, "", "  "]) {
+    assert.deepEqual(
+      routeTasks(ctx, [{ task: "review", profile: "fast", modelSet }], routedConfig),
+      [{
+        task: "review",
+        profile: "fast",
+        modelSet: "claude",
+        modelSetSource: "parent-model",
+        model: "test/large",
+        thinkingLevel: "max",
+      }],
+    );
+  }
 });
 
 test("task model set overrides automatic routing and overlays the baseline profile", () => {
@@ -196,7 +198,7 @@ test("task model set overrides automatic routing and overlays the baseline profi
   assert.deepEqual(
     routeTasks(
       contextWithModels(),
-      [{ task: "independent review", profile: "fast", modelSet: "diverse" }],
+      [{ task: "independent review", profile: "fast", modelSet: " diverse " }],
       routedConfig,
     ),
     [{
@@ -215,6 +217,21 @@ test("task model set overrides automatic routing and overlays the baseline profi
       routedConfig,
     ),
     /model set not found: missing; available: claude, diverse/,
+  );
+  assert.deepEqual(
+    routeTasks(
+      contextWithModels(),
+      [{ task: "review", profile: "fast", modelSet: " " }],
+      routedConfig,
+    ),
+    [{
+      task: "review",
+      profile: "fast",
+      modelSet: "claude",
+      modelSetSource: "default",
+      model: "test/large",
+      thinkingLevel: "low",
+    }],
   );
 });
 

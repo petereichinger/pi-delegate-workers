@@ -160,8 +160,9 @@ export function routeTasks(
   return tasks.map((request) => {
     const profile = request.profile ?? config.defaultProfile;
     const automatic = selectAutomaticModelSet(ctx.model, config);
-    const modelSet = request.modelSet ?? automatic.modelSet;
-    const modelSetSource: ModelSetSource = request.modelSet === undefined
+    const override = request.modelSet?.trim() || undefined;
+    const modelSet = override ?? automatic.modelSet;
+    const modelSetSource: ModelSetSource = override === undefined
       ? automatic.source
       : "task";
     if (modelSet !== undefined && !Object.hasOwn(config.modelSets, modelSet)) {
@@ -640,7 +641,7 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
     modelSet: Type.Optional(
       Type.String({
         description:
-          "Configured model set override; omit to infer it from the current parent model",
+          "Optional configured model set override. Leave out to infer from the current parent model; empty values also use automatic routing.",
       }),
     ),
   });
@@ -655,7 +656,7 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
     promptGuidelines: [
       "Use delegate_tasks for independent subtasks that can run in parallel.",
       "For delegate_tasks, select profile fast for lookups, searches, summaries, and isolated checks; balanced for multi-file tracing, routine changes, and test diagnosis; deep for architecture, security, migrations, and ambiguous root causes.",
-      "For delegate_tasks, omit modelSet to infer it from the current parent model; set modelSet only when the user requests a configured routing override or an independent model family.",
+      "For delegate_tasks, leave modelSet out of each task unless the user requests a configured routing override or an independent model family. The tool selects the model set from the active parent model automatically.",
       "Workers use pi's normal tool set by default (read, write, edit, bash), and can be reconfigured via PI_DELEGATE_TOOLS.",
       "Only delegate tasks that fit the currently configured worker tool allowlist; use PI_DELEGATE_TOOLS=read,grep,find,ls for read-only workers.",
     ],
