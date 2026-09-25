@@ -34,6 +34,7 @@ type TaskRequest = {
   profile?: ProfileName;
   modelSet?: string;
   timeoutMs?: number;
+  tools?: string[];
 };
 
 type ModelSetSource = "task" | "parent-model" | "default" | "none";
@@ -41,6 +42,7 @@ type ModelSetSource = "task" | "parent-model" | "default" | "none";
 type RoutedTask = {
   task: string;
   timeoutMs?: number;
+  tools?: string[];
   profile: ProfileName;
   modelSet?: string;
   modelSetSource: ModelSetSource;
@@ -78,6 +80,7 @@ type DelegatedResult = {
   id: string;
   task: string;
   timeoutMs?: number;
+  tools?: string[];
   profile: ProfileName;
   modelSet?: string;
   modelSetSource: ModelSetSource;
@@ -165,6 +168,20 @@ export function routeTasks(
   config: ResolvedDelegateConfig,
 ): RoutedTask[] {
   return tasks.map((request) => {
+    let tools: string[] | undefined;
+    if (request.tools !== undefined) {
+      if (!Array.isArray(request.tools) || request.tools.length === 0) {
+        throw new Error("delegate-workers task tools must be a non-empty array");
+      }
+      const allowed = getWorkerTools();
+      tools = request.tools.map((tool) => typeof tool === "string" ? tool.trim() : "");
+      if (tools.some((tool) => !tool || !allowed.includes(tool))) {
+        throw new Error(`delegate-workers task tools must be a subset of the worker allowlist: ${allowed.join(", ")}`);
+      }
+      if (new Set(tools).size !== tools.length) {
+        throw new Error("delegate-workers task tools must not contain duplicates");
+      }
+    }
     if (request.timeoutMs !== undefined && (
       !Number.isSafeInteger(request.timeoutMs) ||
       request.timeoutMs < 1 ||
@@ -193,6 +210,7 @@ export function routeTasks(
     const routed: RoutedTask = {
       task: request.task,
       ...(request.timeoutMs === undefined ? {} : { timeoutMs: request.timeoutMs }),
+      ...(tools === undefined ? {} : { tools }),
       profile,
       ...(modelSet === undefined ? {} : { modelSet }),
       modelSetSource,
@@ -283,6 +301,7 @@ function formatResults(results: DelegatedResult[]): string {
         `model_set_source: ${result.modelSetSource}`,
         `model: ${configuredValue(result.model)}`,
         `thinking: ${configuredValue(result.thinkingLevel)}`,
+        ...(result.tools === undefined ? [] : [`tools: ${result.tools.join(",")}`]),
         `duration_ms: ${result.durationMs}`,
         ...(result.timeoutMs === undefined ? [] : [`timeout_ms: ${result.timeoutMs}`]),
         "",
@@ -375,7 +394,8 @@ export async function runTask(
   ]);
   const worker = (options.createWorker ?? createRpcWorker)({
     cwd: ctx.cwd,
-    tools: getWorkerTools(),
+    tools: task.tools ?? getWorkerTools(),
+    enforceTools: task.tools !== undefined,
     model: task.model,
     thinkingLevel: task.thinkingLevel,
     ui: ctx.ui,
@@ -446,6 +466,7 @@ export async function runTask(
     id,
     task: task.task,
     timeoutMs: task.timeoutMs,
+    tools: task.tools,
     profile: task.profile,
     modelSet: task.modelSet,
     modelSetSource: task.modelSetSource,
@@ -690,6 +711,13 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
         description: "Optional deadline in milliseconds for investigation and synthesis together. No timeout by default.",
       }),
     ),
+    tools: Type.Optional(
+      Type.Array(Type.String({ minLength: 1 }), {
+        minItems: 1,
+        uniqueItems: true,
+        description: "Optional per-task tool subset of PI_DELEGATE_TOOLS (default: read,write,edit,bash).",
+      }),
+    ),
   });
 
   pi.registerTool({
@@ -704,7 +732,7 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
       "For delegate_tasks, select profile fast for lookups, searches, summaries, and isolated checks; balanced for multi-file tracing, routine changes, and test diagnosis; deep for architecture, security, migrations, and ambiguous root causes.",
       "For delegate_tasks, leave modelSet out of each task unless the user requests a configured routing override or an independent model family. The tool selects the model set from the active parent model automatically.",
       "Workers use pi's normal tool set by default (read, write, edit, bash), and can be reconfigured via PI_DELEGATE_TOOLS.",
-      "Only delegate tasks that fit the currently configured worker tool allowlist; use PI_DELEGATE_TOOLS=read,grep,find,ls for read-only workers.",
+      "Use a task's tools field for a read-only subset of the configured worker tool allowlist. PI_DELEGATE_TOOLS sets the maximum available tools (default: read,write,edit,bash).",
     ],
     parameters: Type.Object({
       tasks: Type.Array(taskSchema, {
@@ -779,6 +807,7 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
             model: result.model,
             thinkingLevel: result.thinkingLevel,
             timeoutMs: result.timeoutMs,
+            tools: result.tools,
             usage: result.usage,
           })),
         },

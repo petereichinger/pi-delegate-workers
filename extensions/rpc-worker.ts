@@ -233,6 +233,7 @@ function resolveToolGuardExtension(): string | undefined {
 export type WorkerRoutingOptions = {
   model?: string | null;
   thinkingLevel?: ThinkingLevel | null;
+  enforceTools?: boolean;
 };
 
 function removeOptions(args: string[], names: string[]): string[] {
@@ -256,6 +257,9 @@ export function buildWorkerArgs(
   routing: WorkerRoutingOptions = {},
 ): string[] {
   let extraArgs = splitExtraArgs(process.env.PI_DELEGATE_EXTRA_ARGS);
+  if (routing.enforceTools) {
+    extraArgs = removeOptions(extraArgs, ["--tools", "-t"]);
+  }
   if (routing.model !== undefined) {
     extraArgs = removeOptions(extraArgs, ["--model", "--provider"]);
   }
@@ -286,6 +290,7 @@ export function createRpcWorker(options: {
   tools: string[];
   model?: string | null;
   thinkingLevel?: ThinkingLevel | null;
+  enforceTools?: boolean;
   ui?: RpcUi;
   uiPrefix?: string;
   uiDialogQueue?: RpcUiDialogQueue;
@@ -302,6 +307,7 @@ export function createRpcWorker(options: {
     buildWorkerArgs(options.tools, {
       model: options.model,
       thinkingLevel: options.thinkingLevel,
+      enforceTools: options.enforceTools,
     }),
     {
       cwd: options.cwd,

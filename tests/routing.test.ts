@@ -122,6 +122,29 @@ test("routes tasks through explicit and default profiles", () => {
   ]);
 });
 
+test("per-task tools are restricted to the configured worker allowlist", () => {
+  const previous = process.env.PI_DELEGATE_TOOLS;
+  process.env.PI_DELEGATE_TOOLS = "read,write,edit,bash,grep";
+  try {
+    const routed = routeTasks(contextWithModels(), [
+      { task: "normal" },
+      { task: "read-only search", tools: [" read ", "grep"] },
+    ], config);
+    assert.equal(routed[0]?.tools, undefined);
+    assert.deepEqual(routed[1]?.tools, ["read", "grep"]);
+
+    for (const tools of [[], ["write", "unknown"], ["read", " read "], [" "]]) {
+      assert.throws(
+        () => routeTasks(contextWithModels(), [{ task: "invalid", tools }], config),
+        /task tools/,
+      );
+    }
+  } finally {
+    if (previous === undefined) delete process.env.PI_DELEGATE_TOOLS;
+    else process.env.PI_DELEGATE_TOOLS = previous;
+  }
+});
+
 test("routes optional task deadlines and rejects invalid durations", () => {
   assert.equal(
     routeTasks(contextWithModels(), [{ task: "long test", timeoutMs: 1800000 }], config)[0]?.timeoutMs,

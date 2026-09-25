@@ -74,6 +74,35 @@ test("one deadline covers investigation and synthesis", async () => {
   assert.equal(result.cancelled, false);
 });
 
+test("task tool subset reaches the worker without changing the global allowlist", async () => {
+  const previous = process.env.PI_DELEGATE_TOOLS;
+  process.env.PI_DELEGATE_TOOLS = "read,write,edit,bash";
+  let workerOptions: { tools: string[]; enforceTools?: boolean } | undefined;
+  try {
+    const result = await runTask(
+      ctx,
+      new Map(),
+      { task: "read only", profile: "balanced", modelSetSource: "none", tools: ["read"] },
+      "w5",
+      options((settings: { tools: string[]; enforceTools?: boolean }) => {
+        workerOptions = settings;
+        return {
+          prompt: async () => ({ text: "done" }),
+          getUsage: emptyUsage,
+          abort: () => undefined,
+          dispose: () => undefined,
+        };
+      }),
+    );
+    assert.deepEqual(workerOptions?.tools, ["read"]);
+    assert.equal(workerOptions?.enforceTools, true);
+    assert.deepEqual(result.tools, ["read"]);
+  } finally {
+    if (previous === undefined) delete process.env.PI_DELEGATE_TOOLS;
+    else process.env.PI_DELEGATE_TOOLS = previous;
+  }
+});
+
 test("tasks without deadlines can finish, and parent aborts are cancellations", async () => {
   let prompts = 0;
   const finished = await runTask(

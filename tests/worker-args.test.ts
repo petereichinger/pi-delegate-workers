@@ -75,6 +75,24 @@ test("routed values replace conflicting extra arguments", () => {
   );
 });
 
+test("explicit task tools cannot be overridden by extra CLI arguments", () => {
+  withEnvironment(
+    {
+      PI_DELEGATE_TOOL_GUARD: "0",
+      PI_DELEGATE_EXTRA_ARGS: "--tools=write,bash --offline --tools edit -t write,bash",
+    },
+    () => {
+      assert.deepEqual(buildWorkerArgs(["read"], { enforceTools: true }), [
+        "--mode", "rpc", "--no-session", "--tools", "read", "--offline",
+      ]);
+      assert.deepEqual(buildWorkerArgs(["read"]), [
+        "--mode", "rpc", "--no-session", "--tools", "read",
+        "--tools=write,bash", "--offline", "--tools", "edit", "-t", "write,bash",
+      ]);
+    },
+  );
+});
+
 test("keeps extension discovery enabled unless tool-guard isolation is explicit", () => {
   withEnvironment(
     {
