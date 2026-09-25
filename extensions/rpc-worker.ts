@@ -154,6 +154,7 @@ export async function withInputStatus<T>(
 
 function parseJsonl(proc: ChildProcessWithoutNullStreams, onEvent: (event: RpcEvent) => void) {
   let buffer = "";
+  proc.stdout.setEncoding("utf8");
 
   proc.stdout.on("data", (chunk) => {
     buffer += chunk.toString("utf8");
@@ -289,9 +290,14 @@ export function createRpcWorker(options: {
   uiPrefix?: string;
   uiDialogQueue?: RpcUiDialogQueue;
   reportInputStatus?: (active: boolean, label?: string) => void;
+  spawnWorker?: (
+    bin: string,
+    args: string[],
+    options: { cwd: string; stdio: ["pipe", "pipe", "pipe"] },
+  ) => ChildProcessWithoutNullStreams;
 }): RpcWorker {
   const bin = process.env.PI_DELEGATE_PI_BIN || "pi";
-  const proc = spawn(
+  const proc = (options.spawnWorker ?? spawn)(
     bin,
     buildWorkerArgs(options.tools, {
       model: options.model,
