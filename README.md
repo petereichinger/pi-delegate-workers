@@ -8,6 +8,7 @@ It launches separate `pi --mode rpc` worker processes, runs configured tasks in 
 
 - `delegate_tasks` with parent-agent-selected `fast`, `balanced`, or `deep` profiles
 - `/cancel-worker 13` to cancel the running worker shown as `w13` in the live widget (the `w13` form is also accepted)
+- optional per-task deadlines covering investigation and synthesis; tasks have no timeout by default
 - per-profile model and thinking level configuration
 - automatic model-set selection from the active parent model
 - per-task model-set overrides for aligned or cross-model delegation
@@ -142,7 +143,8 @@ The current tool schema uses structured tasks:
     {
       "task": "Run an independent cross-model review",
       "profile": "deep",
-      "modelSet": "diverse"
+      "modelSet": "diverse",
+      "timeoutMs": 1800000
     }
   ],
   "sharedContext": "Optional context shared by every worker"
@@ -150,6 +152,8 @@ The current tool schema uses structured tasks:
 ```
 
 The profile is optional and falls back to `defaultProfile`. Leave `modelSet` out to infer it from the active parent model. Empty or whitespace-only values also use automatic routing. A non-empty task model set overrides automatic routing only for that task; unknown names are rejected. Legacy calls containing string tasks are normalized automatically.
+
+`timeoutMs` is optional per task and must be an integer from 1 to 2,147,483,647 milliseconds. It covers both the investigation and synthesis passes, starting when the worker is launched. Without it, the task has no deadline. An expired task stops its worker process and reports `timed out` separately from cancellation and other errors; usage recorded before expiry is still included.
 
 Each worker starts with the resolved profile on its command line:
 
@@ -174,6 +178,8 @@ When a resolved profile controls the model or thinking level, conflicting `--pro
 ## Notes
 
 - Workers run in the same CWD as the main session.
+- Worker stderr retained for error reports is limited to its last 8,192 characters. Error messages indicate when earlier stderr was truncated.
+- The parent extension captures at most the first 32,768 characters of investigation assistant text and 16,384 characters of synthesis assistant text. Clipped fallback or synthesis reports are marked. This does not limit the worker's conversation context or tool results.
 - The live parent widget keeps each worker's assigned goal and ID visible on a stable line while RPC events update a separate current-activity line. Use `/cancel-worker <id>` to stop one worker without stopping the others.
 - Worker extension UI requests are proxied to the parent UI and parallel dialogs are queued. While a proxied dialog is open, the parent emits `herdr:blocked` so the authoritative TUI integration reports that it is waiting for input.
 - Tool-guard is reused from a parent extension argument or an adjacent `pi-tool-guard` checkout when available. Worker extension discovery stays enabled by default so extension-provided models remain available; set `PI_DELEGATE_TOOL_GUARD_ISOLATE=1` only when duplicate guard discovery is a problem.

@@ -18,6 +18,8 @@ import {
 } from "./config.ts";
 import {
   createRpcWorker,
+  MAX_INVESTIGATION_TEXT_CHARS,
+  MAX_SYNTHESIS_TEXT_CHARS,
   sumUsage,
   type RpcEvent,
   type RpcWorker,
@@ -31,12 +33,14 @@ type TaskRequest = {
   task: string;
   profile?: ProfileName;
   modelSet?: string;
+  timeoutMs?: number;
 };
 
 type ModelSetSource = "task" | "parent-model" | "default" | "none";
 
 type RoutedTask = {
   task: string;
+  timeoutMs?: number;
   profile: ProfileName;
   modelSet?: string;
   modelSetSource: ModelSetSource;
@@ -53,13 +57,12 @@ type WorkerState = {
   thinkingLevel?: DelegateProfileConfig["thinkingLevel"];
   status: string;
   latestMessage: string;
-  output: string;
   worker: RpcWorker;
   abortController: AbortController;
   cancelRequested: boolean;
 };
 
-type WorkerUiState = "starting" | "working" | "synthesizing" | "done" | "cancelled" | "error";
+type WorkerUiState = "starting" | "working" | "synthesizing" | "done" | "cancelled" | "timed out" | "error";
 
 const WORKER_STATE_STYLES = {
   starting: { icon: "", fg: "muted" },
@@ -67,12 +70,14 @@ const WORKER_STATE_STYLES = {
   synthesizing: { icon: "", fg: "warning" },
   done: { icon: "", fg: "success" },
   cancelled: { icon: "", fg: "warning" },
+  "timed out": { icon: "", fg: "warning" },
   error: { icon: "", fg: "error" },
 } as const;
 
 type DelegatedResult = {
   id: string;
   task: string;
+  timeoutMs?: number;
   profile: ProfileName;
   modelSet?: string;
   modelSetSource: ModelSetSource;
@@ -80,6 +85,7 @@ type DelegatedResult = {
   thinkingLevel?: DelegateProfileConfig["thinkingLevel"];
   ok: boolean;
   cancelled: boolean;
+  timedOut: boolean;
   output: string;
   rawOutput: string;
   summaryOutput: string;
@@ -89,6 +95,7 @@ type DelegatedResult = {
 
 const DEFAULT_TOOLS = ["read", "write", "edit", "bash"];
 const DEFAULT_MAX_WORKERS = 5;
+const MAX_TIMEOUT_MS = 2_147_483_647;
 
 function getWorkerTools(): string[] {
   const raw = process.env.PI_DELEGATE_TOOLS?.trim();
@@ -158,6 +165,13 @@ export function routeTasks(
   config: ResolvedDelegateConfig,
 ): RoutedTask[] {
   return tasks.map((request) => {
+    if (request.timeoutMs !== undefined && (
+      !Number.isSafeInteger(request.timeoutMs) ||
+      request.timeoutMs < 1 ||
+      request.timeoutMs > MAX_TIMEOUT_MS
+    )) {
+      throw new Error(`delegate-workers timeoutMs must be an integer between 1 and ${MAX_TIMEOUT_MS}`);
+    }
     const profile = request.profile ?? config.defaultProfile;
     const automatic = selectAutomaticModelSet(ctx.model, config);
     const override = request.modelSet?.trim() || undefined;
@@ -178,6 +192,7 @@ export function routeTasks(
     };
     const routed: RoutedTask = {
       task: request.task,
+      ...(request.timeoutMs === undefined ? {} : { timeoutMs: request.timeoutMs }),
       profile,
       ...(modelSet === undefined ? {} : { modelSet }),
       modelSetSource,
@@ -257,7 +272,7 @@ function formatResults(results: DelegatedResult[]): string {
   return results
     .map((result) => {
       const header = `## ${result.id} — ${result.task}`;
-      const status = result.cancelled ? "cancelled" : result.ok ? "ok" : "error";
+      const status = result.timedOut ? "timed out" : result.cancelled ? "cancelled" : result.ok ? "ok" : "error";
       const body = result.output.trim() || "(no output)";
       return [
         header,
@@ -269,6 +284,7 @@ function formatResults(results: DelegatedResult[]): string {
         `model: ${configuredValue(result.model)}`,
         `thinking: ${configuredValue(result.thinkingLevel)}`,
         `duration_ms: ${result.durationMs}`,
+        ...(result.timeoutMs === undefined ? [] : [`timeout_ms: ${result.timeoutMs}`]),
         "",
         body,
       ].join("\n");
@@ -280,6 +296,7 @@ function getWorkerUiState(status: string): WorkerUiState {
   if (status === "synthesizing") return "synthesizing";
   if (status === "done") return "done";
   if (status === "cancelled") return "cancelled";
+  if (status === "timed out") return "timed out";
   if (status === "error") return "error";
   if (status === "starting") return "starting";
   return "working";
@@ -289,6 +306,10 @@ function compactActivity(text: string, maxChars = 140): string {
   const compact = text.replace(/\s+/g, " ").trim();
   if (compact.length <= maxChars) return compact;
   return `${compact.slice(0, maxChars - 1)}…`;
+}
+
+export function appendWorkerActivity(current: string, delta: string): string {
+  return compactActivity(current + delta);
 }
 
 export function describeWorkerTool(event: RpcEvent): string {
@@ -331,7 +352,7 @@ function refreshUi(ctx: ExtensionContext, workers: Map<string, WorkerState>) {
   ctx.ui.setWidget("delegate-workers", widgetLines, { placement: "aboveEditor" });
 }
 
-async function runTask(
+export async function runTask(
   ctx: ExtensionContext,
   workers: Map<string, WorkerState>,
   task: RoutedTask,
@@ -341,13 +362,18 @@ async function runTask(
     sharedContext?: string;
     uiDialogQueue: RpcUiDialogQueue;
     reportInputStatus: (active: boolean, label?: string) => void;
+    createWorker?: typeof createRpcWorker;
   },
 ): Promise<DelegatedResult> {
   const abortController = new AbortController();
-  const signal = options.signal
-    ? AbortSignal.any([options.signal, abortController.signal])
-    : abortController.signal;
-  const worker = createRpcWorker({
+  const deadlineController = new AbortController();
+  const timeoutReason = new Error(`Worker ${id} timed out after ${task.timeoutMs} ms.`);
+  const signal = AbortSignal.any([
+    ...(options.signal ? [options.signal] : []),
+    abortController.signal,
+    deadlineController.signal,
+  ]);
+  const worker = (options.createWorker ?? createRpcWorker)({
     cwd: ctx.cwd,
     tools: getWorkerTools(),
     model: task.model,
@@ -365,8 +391,7 @@ async function runTask(
     model: task.model,
     thinkingLevel: task.thinkingLevel,
     status: "starting",
-    latestMessage: `Starting: ${task.task}`,
-    output: "",
+    latestMessage: compactActivity(`Starting: ${task.task}`),
     worker,
     abortController,
     cancelRequested: false,
@@ -375,6 +400,10 @@ async function runTask(
   workers.set(id, state);
   refreshUi(ctx, workers);
   const startedAt = Date.now();
+  const deadline = task.timeoutMs === undefined ? undefined : setTimeout(
+    () => deadlineController.abort(timeoutReason),
+    task.timeoutMs,
+  );
 
   const onEvent = (event: RpcEvent) => {
     if (event.type === "message_start" && event.message?.role === "assistant") {
@@ -385,7 +414,7 @@ async function runTask(
 
     if (event.type === "agent_start") {
       state.status = "running";
-      state.latestMessage = `Investigating: ${task.task}`;
+      state.latestMessage = compactActivity(`Investigating: ${task.task}`);
       refreshUi(ctx, workers);
       return;
     }
@@ -401,9 +430,8 @@ async function runTask(
       event.type === "message_update" &&
       event.assistantMessageEvent?.type === "text_delta"
     ) {
-      state.output += event.assistantMessageEvent.delta;
       if (state.latestMessage === "Thinking about the next step") state.latestMessage = "";
-      state.latestMessage += event.assistantMessageEvent.delta;
+      state.latestMessage = appendWorkerActivity(state.latestMessage, event.assistantMessageEvent.delta);
       refreshUi(ctx, workers);
       return;
     }
@@ -417,6 +445,7 @@ async function runTask(
   const resultBase = {
     id,
     task: task.task,
+    timeoutMs: task.timeoutMs,
     profile: task.profile,
     modelSet: task.modelSet,
     modelSetSource: task.modelSetSource,
@@ -430,18 +459,22 @@ async function runTask(
       {
         onEvent,
         signal,
+        maxTextChars: MAX_INVESTIGATION_TEXT_CHARS,
       },
     );
 
     state.status = "synthesizing";
     state.latestMessage = "Synthesizing findings";
-    state.output = "";
     refreshUi(ctx, workers);
 
     let summaryText = truncateFallback(investigation.text);
+    if (investigation.truncated) {
+      summaryText += "\n\n[investigation text capture truncated; worker context unchanged]";
+    }
     try {
       const summary = await worker.prompt(buildSummaryPrompt(task.task), {
         signal,
+        maxTextChars: MAX_SYNTHESIS_TEXT_CHARS,
         onEvent: (event: RpcEvent) => {
           if (event.type === "message_start" && event.message?.role === "assistant") {
             state.latestMessage = "Synthesizing findings";
@@ -460,9 +493,8 @@ async function runTask(
             event.type === "message_update" &&
             event.assistantMessageEvent?.type === "text_delta"
           ) {
-            state.output += event.assistantMessageEvent.delta;
             if (state.latestMessage === "Synthesizing findings") state.latestMessage = "";
-            state.latestMessage += event.assistantMessageEvent.delta;
+            state.latestMessage = appendWorkerActivity(state.latestMessage, event.assistantMessageEvent.delta);
             refreshUi(ctx, workers);
             return;
           }
@@ -474,13 +506,14 @@ async function runTask(
         },
       });
 
-      summaryText = summary.text.trim() || summaryText;
+      if (summary.text.trim()) {
+        summaryText = summary.text.trim();
+        if (summary.truncated) summaryText += "\n\n[synthesis text truncated before returning to parent agent]";
+      }
     } catch (error) {
       if (signal.aborted) throw error;
-      state.output = summaryText;
     }
 
-    state.output = summaryText;
     state.latestMessage = "Done";
     state.status = "done";
     refreshUi(ctx, workers);
@@ -489,6 +522,7 @@ async function runTask(
       ...resultBase,
       ok: true,
       cancelled: false,
+      timedOut: false,
       output: summaryText,
       rawOutput: investigation.text,
       summaryOutput: summaryText,
@@ -496,18 +530,22 @@ async function runTask(
       usage: worker.getUsage(),
     };
   } catch (error) {
-    const cancelled = state.cancelRequested;
-    const message = cancelled
-      ? `Worker ${id} was cancelled.`
-      : error instanceof Error ? error.message : String(error);
-    state.status = cancelled ? "cancelled" : "error";
-    state.latestMessage = cancelled ? "Cancelled" : `Error: ${message}`;
+    const timedOut = signal.aborted && signal.reason === timeoutReason;
+    const cancelled = signal.aborted && !timedOut;
+    const message = timedOut
+      ? timeoutReason.message
+      : cancelled
+        ? `Worker ${id} was cancelled.`
+        : error instanceof Error ? error.message : String(error);
+    state.status = timedOut ? "timed out" : cancelled ? "cancelled" : "error";
+    state.latestMessage = timedOut ? "Timed out" : cancelled ? "Cancelled" : `Error: ${message}`;
     refreshUi(ctx, workers);
 
     return {
       ...resultBase,
       ok: false,
       cancelled,
+      timedOut,
       output: message,
       rawOutput: message,
       summaryOutput: message,
@@ -515,6 +553,7 @@ async function runTask(
       usage: worker.getUsage(),
     };
   } finally {
+    if (deadline) clearTimeout(deadline);
     worker.dispose();
     workers.delete(id);
     refreshUi(ctx, workers);
@@ -644,6 +683,13 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
           "Optional configured model set override. Leave out to infer from the current parent model; empty values also use automatic routing.",
       }),
     ),
+    timeoutMs: Type.Optional(
+      Type.Integer({
+        minimum: 1,
+        maximum: MAX_TIMEOUT_MS,
+        description: "Optional deadline in milliseconds for investigation and synthesis together. No timeout by default.",
+      }),
+    ),
   });
 
   pi.registerTool({
@@ -714,6 +760,7 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
       const combined = formatResults(results);
       const failed = results.filter((result) => !result.ok).length;
       const cancelled = results.filter((result) => result.cancelled).length;
+      const timedOut = results.filter((result) => result.timedOut).length;
       const usage = sumUsage(results.map((result) => result.usage));
 
       return {
@@ -723,6 +770,7 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
           taskCount: results.length,
           failedTasks: failed,
           cancelledTasks: cancelled,
+          timedOutTasks: timedOut,
           routes: results.map((result) => ({
             id: result.id,
             profile: result.profile,
@@ -730,6 +778,7 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
             modelSetSource: result.modelSetSource,
             model: result.model,
             thinkingLevel: result.thinkingLevel,
+            timeoutMs: result.timeoutMs,
             usage: result.usage,
           })),
         },

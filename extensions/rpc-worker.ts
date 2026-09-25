@@ -8,11 +8,29 @@ import type { RpcUiDialogQueue } from "./ui-dialog-queue.ts";
 
 export type RpcEvent = any;
 
+const MAX_STDERR_CHARS = 8_192;
+export const MAX_INVESTIGATION_TEXT_CHARS = 32_768;
+export const MAX_SYNTHESIS_TEXT_CHARS = 16_384;
+
+type StderrBuffer = { text: string; truncated: boolean };
+
+export function appendStderr(buffer: StderrBuffer, chunk: string): StderrBuffer {
+  const truncated = buffer.truncated || buffer.text.length + chunk.length > MAX_STDERR_CHARS;
+  return {
+    text: (buffer.text + chunk.slice(-MAX_STDERR_CHARS)).slice(-MAX_STDERR_CHARS),
+    truncated,
+  };
+}
+
+function stderrDetail(buffer: StderrBuffer): string {
+  return `${buffer.truncated ? "[earlier stderr truncated]\n" : ""}${buffer.text.trim()}`;
+}
+
 export type RpcWorker = {
   prompt(
     message: string,
-    options?: { onEvent?: (event: RpcEvent) => void; signal?: AbortSignal }
-  ): Promise<{ text: string }>;
+    options?: { onEvent?: (event: RpcEvent) => void; signal?: AbortSignal; maxTextChars?: number }
+  ): Promise<{ text: string; truncated?: boolean }>;
   getUsage(): Usage;
   abort(): void;
   dispose(): void;
@@ -88,14 +106,28 @@ type RpcUi = {
 type ActivePrompt = {
   id: string;
   text: string;
+  truncated: boolean;
+  maxTextChars: number;
   onEvent?: (event: RpcEvent) => void;
-  resolve: (value: { text: string }) => void;
+  resolve: (value: { text: string; truncated: boolean }) => void;
   reject: (error: Error) => void;
   cleanup: () => void;
 };
 
 function randomId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+export function appendBoundedText(
+  current: { text: string; truncated: boolean },
+  delta: string,
+  maxChars: number,
+): { text: string; truncated: boolean } {
+  const remaining = Math.max(0, maxChars - current.text.length);
+  return {
+    text: current.text + delta.slice(0, remaining),
+    truncated: current.truncated || delta.length > remaining,
+  };
 }
 
 export async function withInputStatus<T>(
@@ -272,12 +304,12 @@ export function createRpcWorker(options: {
   );
 
   let disposed = false;
-  let stderr = "";
+  let stderr: StderrBuffer = { text: "", truncated: false };
   let activePrompt: ActivePrompt | undefined;
   let usage = emptyUsage();
 
   proc.stderr.on("data", (chunk) => {
-    stderr += chunk.toString("utf8");
+    stderr = appendStderr(stderr, chunk.toString("utf8"));
   });
 
   const respondToUiRequest = (id: string, response: Record<string, unknown>) => {
@@ -389,12 +421,18 @@ export function createRpcWorker(options: {
       event.type === "message_update" &&
       event.assistantMessageEvent?.type === "text_delta"
     ) {
-      activePrompt.text += event.assistantMessageEvent.delta;
+      const next = appendBoundedText(
+        activePrompt,
+        event.assistantMessageEvent.delta,
+        activePrompt.maxTextChars,
+      );
+      activePrompt.text = next.text;
+      activePrompt.truncated = next.truncated;
       return;
     }
 
     if (event.type === "response" && event.id === activePrompt.id && event.success === false) {
-      const message = event.error || stderr || "Worker prompt failed";
+      const message = event.error || stderrDetail(stderr) || "Worker prompt failed";
       const reject = activePrompt.reject;
       activePrompt.cleanup();
       activePrompt = undefined;
@@ -404,10 +442,10 @@ export function createRpcWorker(options: {
 
     if (event.type === "agent_settled") {
       const resolve = activePrompt.resolve;
-      const text = activePrompt.text;
+      const { text, truncated } = activePrompt;
       activePrompt.cleanup();
       activePrompt = undefined;
-      resolve({ text });
+      resolve({ text, truncated });
     }
   });
 
@@ -426,7 +464,7 @@ export function createRpcWorker(options: {
     const reject = activePrompt.reject;
     activePrompt.cleanup();
     activePrompt = undefined;
-    const detail = stderr.trim() || `worker exited with code=${code} signal=${signal}`;
+    const detail = stderrDetail(stderr) || `worker exited with code=${code} signal=${signal}`;
     reject(new Error(detail));
   });
 
@@ -447,7 +485,13 @@ export function createRpcWorker(options: {
         return Promise.reject(new Error("Worker prompt aborted"));
       }
 
-      return new Promise<{ text: string }>((resolve, reject) => {
+      if (options.maxTextChars !== undefined && (
+        !Number.isSafeInteger(options.maxTextChars) || options.maxTextChars < 1
+      )) {
+        return Promise.reject(new Error("maxTextChars must be a positive integer"));
+      }
+
+      return new Promise<{ text: string; truncated: boolean }>((resolve, reject) => {
         const id = randomId("prompt");
         const abortHandler = () => {
           try {
@@ -470,6 +514,8 @@ export function createRpcWorker(options: {
         activePrompt = {
           id,
           text: "",
+          truncated: false,
+          maxTextChars: options.maxTextChars ?? MAX_INVESTIGATION_TEXT_CHARS,
           onEvent: options.onEvent,
           resolve,
           reject,

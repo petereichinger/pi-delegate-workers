@@ -122,6 +122,19 @@ test("routes tasks through explicit and default profiles", () => {
   ]);
 });
 
+test("routes optional task deadlines and rejects invalid durations", () => {
+  assert.equal(
+    routeTasks(contextWithModels(), [{ task: "long test", timeoutMs: 1800000 }], config)[0]?.timeoutMs,
+    1800000,
+  );
+  for (const timeoutMs of [0, -1, 1.5, Number.NaN, 2_147_483_648]) {
+    assert.throws(
+      () => routeTasks(contextWithModels(), [{ task: "invalid", timeoutMs }], config),
+      /timeoutMs must be an integer/,
+    );
+  }
+});
+
 test("rejects model-specific unsupported thinking levels before spawn", () => {
   const invalid: ResolvedDelegateConfig = {
     ...config,

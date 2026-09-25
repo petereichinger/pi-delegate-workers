@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  appendWorkerActivity,
   describeWorkerTool,
   formatWorkerDisplayLines,
 } from "../extensions/index.ts";
@@ -25,6 +26,15 @@ test("describes unknown tools without requiring arguments", () => {
     describeWorkerTool({ type: "tool_execution_start", toolName: "custom_tool" }),
     "Using custom_tool",
   );
+});
+
+test("bounds streamed worker activity without changing its displayed prefix", () => {
+  const first = appendWorkerActivity("", "a".repeat(200));
+  const next = appendWorkerActivity(first, "b".repeat(200));
+
+  assert.equal(first, `${"a".repeat(139)}…`);
+  assert.equal(next, first);
+  assert.equal(appendWorkerActivity("Reading ", "a file"), "Reading a file");
 });
 
 test("keeps the worker goal stable while current activity changes", () => {
