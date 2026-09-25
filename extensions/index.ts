@@ -28,6 +28,7 @@ import {
   createRpcUiDialogQueue,
   type RpcUiDialogQueue,
 } from "./ui-dialog-queue.ts";
+import { createWidgetRefresh, type WidgetRefresh } from "./widget-refresh.ts";
 
 type TaskRequest = {
   task: string;
@@ -382,6 +383,7 @@ export async function runTask(
     uiDialogQueue: RpcUiDialogQueue;
     reportInputStatus: (active: boolean, label?: string) => void;
     createWorker?: typeof createRpcWorker;
+    widgetRefresh?: WidgetRefresh<ExtensionContext>;
   },
 ): Promise<DelegatedResult> {
   const abortController = new AbortController();
@@ -403,6 +405,15 @@ export async function runTask(
     uiDialogQueue: options.uiDialogQueue,
     reportInputStatus: options.reportInputStatus,
   });
+  const updateWidget = (scheduled = false) => {
+    if (!options.widgetRefresh) {
+      refreshUi(ctx, workers);
+    } else if (scheduled) {
+      options.widgetRefresh.schedule(ctx);
+    } else {
+      options.widgetRefresh.immediate(ctx);
+    }
+  };
   const state: WorkerState = {
     id,
     task: task.task,
@@ -418,7 +429,7 @@ export async function runTask(
   };
 
   workers.set(id, state);
-  refreshUi(ctx, workers);
+  updateWidget();
   const startedAt = Date.now();
   const deadline = task.timeoutMs === undefined ? undefined : setTimeout(
     () => deadlineController.abort(timeoutReason),
@@ -428,21 +439,21 @@ export async function runTask(
   const onEvent = (event: RpcEvent) => {
     if (event.type === "message_start" && event.message?.role === "assistant") {
       state.latestMessage = "Thinking about the next step";
-      refreshUi(ctx, workers);
+      updateWidget();
       return;
     }
 
     if (event.type === "agent_start") {
       state.status = "running";
       state.latestMessage = compactActivity(`Investigating: ${task.task}`);
-      refreshUi(ctx, workers);
+      updateWidget();
       return;
     }
 
     if (event.type === "tool_execution_start") {
       state.status = `tool:${event.toolName}`;
       state.latestMessage = describeWorkerTool(event);
-      refreshUi(ctx, workers);
+      updateWidget();
       return;
     }
 
@@ -450,15 +461,16 @@ export async function runTask(
       event.type === "message_update" &&
       event.assistantMessageEvent?.type === "text_delta"
     ) {
+      const previousMessage = state.latestMessage;
       if (state.latestMessage === "Thinking about the next step") state.latestMessage = "";
       state.latestMessage = appendWorkerActivity(state.latestMessage, event.assistantMessageEvent.delta);
-      refreshUi(ctx, workers);
+      if (state.latestMessage !== previousMessage) updateWidget(true);
       return;
     }
 
     if (event.type === "agent_end") {
       state.status = "done";
-      refreshUi(ctx, workers);
+      updateWidget();
     }
   };
 
@@ -486,7 +498,7 @@ export async function runTask(
 
     state.status = "synthesizing";
     state.latestMessage = "Synthesizing findings";
-    refreshUi(ctx, workers);
+    updateWidget();
 
     let summaryText = truncateFallback(investigation.text);
     if (investigation.truncated) {
@@ -499,14 +511,14 @@ export async function runTask(
         onEvent: (event: RpcEvent) => {
           if (event.type === "message_start" && event.message?.role === "assistant") {
             state.latestMessage = "Synthesizing findings";
-            refreshUi(ctx, workers);
+            updateWidget();
             return;
           }
 
           if (event.type === "agent_start") {
             state.status = "synthesizing";
             state.latestMessage = "Synthesizing findings";
-            refreshUi(ctx, workers);
+            updateWidget();
             return;
           }
 
@@ -514,15 +526,16 @@ export async function runTask(
             event.type === "message_update" &&
             event.assistantMessageEvent?.type === "text_delta"
           ) {
+            const previousMessage = state.latestMessage;
             if (state.latestMessage === "Synthesizing findings") state.latestMessage = "";
             state.latestMessage = appendWorkerActivity(state.latestMessage, event.assistantMessageEvent.delta);
-            refreshUi(ctx, workers);
+            if (state.latestMessage !== previousMessage) updateWidget(true);
             return;
           }
 
           if (event.type === "agent_end") {
             state.status = "done";
-            refreshUi(ctx, workers);
+            updateWidget();
           }
         },
       });
@@ -537,7 +550,7 @@ export async function runTask(
 
     state.latestMessage = "Done";
     state.status = "done";
-    refreshUi(ctx, workers);
+    updateWidget();
 
     return {
       ...resultBase,
@@ -560,7 +573,7 @@ export async function runTask(
         : error instanceof Error ? error.message : String(error);
     state.status = timedOut ? "timed out" : cancelled ? "cancelled" : "error";
     state.latestMessage = timedOut ? "Timed out" : cancelled ? "Cancelled" : `Error: ${message}`;
-    refreshUi(ctx, workers);
+    updateWidget();
 
     return {
       ...resultBase,
@@ -577,12 +590,13 @@ export async function runTask(
     if (deadline) clearTimeout(deadline);
     worker.dispose();
     workers.delete(id);
-    refreshUi(ctx, workers);
+    updateWidget();
   }
 }
 
 export default function delegateWorkersExtension(pi: ExtensionAPI) {
   const workers = new Map<string, WorkerState>();
+  const widgetRefresh = createWidgetRefresh((ctx: ExtensionContext) => refreshUi(ctx, workers));
   const uiDialogQueue = createRpcUiDialogQueue();
   let nextWorkerId = 1;
   let inferredModelSetInitialized = false;
@@ -611,7 +625,7 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
   };
 
   pi.on("session_start", async (_event, ctx) => {
-    refreshUi(ctx, workers);
+    widgetRefresh.immediate(ctx);
     delegateConfigLoader.invalidate();
     try {
       const loaded = await delegateConfigLoader.load(ctx);
@@ -647,6 +661,7 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
+    widgetRefresh.cancel();
     for (const worker of workers.values()) {
       worker.worker.dispose();
     }
@@ -685,7 +700,7 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
       requestWorkerCancellation(state);
       state.status = "cancelled";
       state.latestMessage = "Cancelling";
-      refreshUi(ctx, workers);
+      widgetRefresh.immediate(ctx);
       ctx.ui.notify(`Cancelling worker ${id}...`, "info");
     },
   });
@@ -770,6 +785,7 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
             sharedContext: params.sharedContext,
             uiDialogQueue,
             reportInputStatus,
+            widgetRefresh,
           }),
         ),
       );
