@@ -21,7 +21,8 @@
 - Run `npm run typecheck` after TypeScript changes.
 - Add or update tests for bug fixes and behavior changes.
 - Keep `README.md` synchronized with changes to commands, tool schemas, configuration, or environment variables.
-- Preserve backward compatibility for documented configuration and tool inputs unless a breaking change is intentional.
+- Preserve backward compatibility for persisted configuration files unless a breaking change is intentional.
+- Worker RPC messages and agent-generated `delegate_tasks` inputs are transient within a session. They do not need cross-version compatibility; remove obsolete input shims instead of maintaining them.
 
 ## Versioning
 

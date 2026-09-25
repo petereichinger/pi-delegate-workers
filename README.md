@@ -151,7 +151,7 @@ The current tool schema uses structured tasks:
 }
 ```
 
-The profile is optional and falls back to `defaultProfile`. Leave `modelSet` out to infer it from the active parent model. Empty or whitespace-only values also use automatic routing. A non-empty task model set overrides automatic routing only for that task; unknown names are rejected. Legacy calls containing string tasks are normalized automatically.
+The profile is optional and falls back to `defaultProfile`. Leave `modelSet` out to infer it from the active parent model. Empty or whitespace-only values also use automatic routing. A non-empty task model set overrides automatic routing only for that task; unknown names are rejected. Tasks must use the structured object format shown above.
 
 `timeoutMs` is optional per task and must be an integer from 1 to 2,147,483,647 milliseconds. It covers both the investigation and synthesis passes, starting when the worker is launched. Without it, the task has no deadline. An expired task stops its worker process and reports `timed out` separately from cancellation and other errors; usage recorded before expiry is still included.
 

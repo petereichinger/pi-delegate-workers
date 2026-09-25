@@ -745,17 +745,6 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
         }),
       ),
     }),
-    prepareArguments(args) {
-      if (!args || typeof args !== "object" || Array.isArray(args)) return args as any;
-      const input = args as { tasks?: unknown };
-      if (!Array.isArray(input.tasks)) return args as any;
-      return {
-        ...input,
-        tasks: input.tasks.map((task) =>
-          typeof task === "string" ? { task } : task,
-        ),
-      } as any;
-    },
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const maxWorkers = getMaxWorkers();
       if (params.tasks.length > maxWorkers) {
