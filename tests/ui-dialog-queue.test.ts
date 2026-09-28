@@ -35,6 +35,20 @@ test("RPC UI dialogs run one at a time in arrival order", async () => {
   ]);
 });
 
+test("a cancelled queued dialog is skipped without delaying the next dialog", async () => {
+  const queue = createRpcUiDialogQueue();
+  const controller = new AbortController();
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const first = queue.enqueue(() => blocked);
+  const skipped = queue.enqueue(async () => { throw new Error("cancelled dialog was shown"); }, controller.signal);
+  const next = queue.enqueue(async () => "next");
+
+  controller.abort();
+  release();
+  assert.deepEqual(await Promise.all([first, skipped, next]), [undefined, undefined, "next"]);
+});
+
 test("a failed dialog does not stall the queue", async () => {
   const queue = createRpcUiDialogQueue();
 

@@ -135,6 +135,45 @@ test("RPC abort is sent to the child and rejects the active prompt", { timeout: 
   }
 });
 
+test("an aborted prompt cannot be followed until the old run settles", { timeout: 5000 }, async () => {
+  const controller = new AbortController();
+  let oldSettled!: () => void;
+  const settled = new Promise<void>((resolve) => { oldSettled = resolve; });
+  const worker = fakeWorker("late-settle", {
+    ui: { notify: (message: string) => { if (message === "[delegate worker] old settled") oldSettled(); } },
+  });
+  try {
+    const first = worker.prompt("first", { signal: controller.signal });
+    controller.abort();
+    await assert.rejects(first, /Worker prompt aborted/);
+    await assert.rejects(worker.prompt("too early"), /waiting for an aborted prompt to settle/);
+    await settled;
+    assert.deepEqual(await worker.prompt("second", { signal: AbortSignal.timeout(3000) }), {
+      text: "summary", truncated: false,
+    });
+  } finally {
+    worker.dispose();
+  }
+});
+
+test("oversized unfinished RPC records fail the prompt and stop the child", { timeout: 8000 }, async () => {
+  let child: ChildProcessWithoutNullStreams | undefined;
+  const worker = createRpcWorker({
+    cwd: process.cwd(),
+    tools: ["read"],
+    spawnWorker: (_bin, args, options) => {
+      child = spawn(process.execPath, [fixture, "oversized", ...args], options);
+      return child;
+    },
+  });
+  try {
+    await assert.rejects(worker.prompt("large", { signal: AbortSignal.timeout(6000) }), /RPC record exceeds 16777216 bytes/);
+    assert.equal(child?.killed, true);
+  } finally {
+    worker.dispose();
+  }
+});
+
 test("real RPC worker deadline reports timeout and stops the child", { timeout: 5000 }, async () => {
   const ctx = {
     cwd: process.cwd(),
@@ -178,6 +217,39 @@ test("disposing an active RPC worker terminates its child", { timeout: 5000 }, a
   worker.dispose();
   await assert.rejects(prompt, /worker exited/);
   assert.equal(child?.killed, true);
+});
+
+test("disposing a worker dismisses its open dialog and releases the shared queue", { timeout: 5000 }, async () => {
+  const queue = createRpcUiDialogQueue();
+  let opened!: () => void;
+  const dialogOpened = new Promise<void>((resolve) => { opened = resolve; });
+  const statuses: boolean[] = [];
+  const stalled = fakeWorker("dialog", {
+    uiDialogQueue: queue,
+    reportInputStatus: (active: boolean) => { statuses.push(active); },
+    ui: {
+      confirm: (_title: string, _message: string, options: { signal: AbortSignal }) => new Promise<boolean>((resolve) => {
+        opened();
+        options.signal.addEventListener("abort", () => resolve(false), { once: true });
+      }),
+    },
+  });
+  const next = fakeWorker("dialog", {
+    uiDialogQueue: queue,
+    ui: { confirm: async () => true },
+  });
+  try {
+    const pending = stalled.prompt("ask", { signal: AbortSignal.timeout(3000) });
+    await dialogOpened;
+    const succeeding = next.prompt("ask", { signal: AbortSignal.timeout(3000) });
+    stalled.dispose();
+    await assert.rejects(pending, /worker exited/);
+    assert.deepEqual(await succeeding, { text: "confirmed", truncated: false });
+    assert.deepEqual(statuses, [true, false]);
+  } finally {
+    stalled.dispose();
+    next.dispose();
+  }
 });
 
 test("RPC dialog is forwarded and its response reaches the worker", { timeout: 5000 }, async () => {

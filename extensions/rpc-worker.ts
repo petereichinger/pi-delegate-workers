@@ -9,6 +9,7 @@ import type { RpcUiDialogQueue } from "./ui-dialog-queue.ts";
 export type RpcEvent = any;
 
 const MAX_STDERR_CHARS = 8_192;
+const MAX_RPC_RECORD_BYTES = 16 * 1024 * 1024;
 export const MAX_INVESTIGATION_TEXT_CHARS = 32_768;
 export const MAX_SYNTHESIS_TEXT_CHARS = 16_384;
 
@@ -152,27 +153,44 @@ export async function withInputStatus<T>(
   }
 }
 
-function parseJsonl(proc: ChildProcessWithoutNullStreams, onEvent: (event: RpcEvent) => void) {
+function parseJsonl(
+  proc: ChildProcessWithoutNullStreams,
+  onEvent: (event: RpcEvent) => void,
+  onOversizedRecord: () => void,
+) {
   let buffer = "";
+  let bufferBytes = 0;
+  let stopped = false;
   proc.stdout.setEncoding("utf8");
 
-  proc.stdout.on("data", (chunk) => {
-    buffer += chunk.toString("utf8");
-
-    while (true) {
-      const newline = buffer.indexOf("\n");
-      if (newline === -1) break;
-
-      let line = buffer.slice(0, newline);
-      buffer = buffer.slice(newline + 1);
-      if (line.endsWith("\r")) line = line.slice(0, -1);
-      if (!line.trim()) continue;
-
-      try {
-        onEvent(JSON.parse(line));
-      } catch {
-        // Ignore malformed lines from the child process.
+  proc.stdout.on("data", (chunk: string) => {
+    if (stopped) return;
+    let start = 0;
+    while (start < chunk.length) {
+      const newline = chunk.indexOf("\n", start);
+      const end = newline === -1 ? chunk.length : newline;
+      const part = chunk.slice(start, end);
+      bufferBytes += Buffer.byteLength(part, "utf8");
+      if (bufferBytes > MAX_RPC_RECORD_BYTES) {
+        stopped = true;
+        onOversizedRecord();
+        return;
       }
+      buffer += part;
+      if (newline === -1) return;
+
+      let line = buffer;
+      buffer = "";
+      bufferBytes = 0;
+      if (line.endsWith("\r")) line = line.slice(0, -1);
+      if (line.trim()) {
+        try {
+          onEvent(JSON.parse(line));
+        } catch {
+          // Ignore malformed lines from the child process.
+        }
+      }
+      start = newline + 1;
     }
   });
 }
@@ -316,6 +334,8 @@ export function createRpcWorker(options: {
   );
 
   let disposed = false;
+  let awaitingAbortedSettle: string | undefined;
+  const dialogController = new AbortController();
   let stderr: StderrBuffer = { text: "", truncated: false };
   let activePrompt: ActivePrompt | undefined;
   let usage = emptyUsage();
@@ -353,7 +373,7 @@ export function createRpcWorker(options: {
       return;
     }
 
-    const dialogOptions = timeout === undefined ? undefined : { timeout };
+    const dialogOptions = { signal: dialogController.signal, ...(timeout === undefined ? {} : { timeout }) };
     const prefix = options.uiPrefix ? `[${options.uiPrefix}] ` : "[delegate worker] ";
     const inputLabel = `${prefix}${event.title ?? "Waiting for input"}`;
     const invokeUiMethod = async () => {
@@ -419,12 +439,20 @@ export function createRpcWorker(options: {
       const receivedAt = Date.now();
       const handleRequest = () => handleUiRequest(event, receivedAt);
       if (dialogMethods.has(event.method) && options.uiDialogQueue) {
-        void options.uiDialogQueue.enqueue(handleRequest);
+        void options.uiDialogQueue.enqueue(handleRequest, dialogController.signal);
       } else {
         void handleRequest();
       }
     }
 
+    if (awaitingAbortedSettle) {
+      if (event.type === "agent_settled" || (
+        event.type === "response" && event.id === awaitingAbortedSettle && event.success === false
+      )) {
+        awaitingAbortedSettle = undefined;
+      }
+      return;
+    }
     if (!activePrompt) return;
 
     activePrompt.onEvent?.(event);
@@ -459,9 +487,31 @@ export function createRpcWorker(options: {
       activePrompt = undefined;
       resolve({ text, truncated });
     }
+  }, () => {
+    const error = new Error(`Worker RPC record exceeds ${MAX_RPC_RECORD_BYTES} bytes`);
+    disposed = true;
+    dialogController.abort();
+    if (activePrompt) {
+      const reject = activePrompt.reject;
+      activePrompt.cleanup();
+      activePrompt = undefined;
+      reject(error);
+    }
+    try {
+      proc.stdin.end();
+    } catch {
+      // The worker may already be gone.
+    }
+    try {
+      proc.kill("SIGTERM");
+    } catch {
+      // The worker may already be gone.
+    }
   });
 
   proc.on("error", (error) => {
+    disposed = true;
+    dialogController.abort();
     if (!activePrompt) return;
     const reject = activePrompt.reject;
     activePrompt.cleanup();
@@ -471,6 +521,7 @@ export function createRpcWorker(options: {
 
   proc.on("exit", (code, signal) => {
     disposed = true;
+    dialogController.abort();
     if (!activePrompt) return;
 
     const reject = activePrompt.reject;
@@ -489,6 +540,12 @@ export function createRpcWorker(options: {
 
   return {
     prompt(message, options = {}) {
+      if (disposed || proc.killed) {
+        return Promise.reject(new Error("Worker is not running"));
+      }
+      if (awaitingAbortedSettle) {
+        return Promise.reject(new Error("Worker is waiting for an aborted prompt to settle"));
+      }
       if (activePrompt) {
         return Promise.reject(new Error("Worker already has an active prompt"));
       }
@@ -513,6 +570,7 @@ export function createRpcWorker(options: {
           }
 
           if (!activePrompt || activePrompt.id !== id) return;
+          awaitingAbortedSettle = id;
           const localReject = activePrompt.reject;
           activePrompt.cleanup();
           activePrompt = undefined;
@@ -562,6 +620,7 @@ export function createRpcWorker(options: {
 
     dispose() {
       disposed = true;
+      dialogController.abort();
       try {
         proc.stdin.end();
       } catch {

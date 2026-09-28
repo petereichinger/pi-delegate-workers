@@ -35,6 +35,13 @@ async function finish(text) {
 function receive(record) {
   if (record.type === "abort") {
     send({ type: "extension_ui_request", id: "abort-notice", method: "notify", message: "abort received" });
+    if (scenario === "late-settle") {
+      setTimeout(() => {
+        send({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "old text" } });
+        send({ type: "agent_settled" });
+        send({ type: "extension_ui_request", id: "settled-notice", method: "notify", message: "old settled" });
+      }, 30);
+    }
     return;
   }
   if (record.type === "extension_ui_response") {
@@ -53,7 +60,11 @@ function receive(record) {
     return;
   }
   send({ type: "response", id: record.id, command: "prompt", success: true });
-  if (scenario === "stall") return;
+  if (scenario === "stall" || (scenario === "late-settle" && prompts === 1)) return;
+  if (scenario === "oversized") {
+    process.stdout.write("x".repeat(16 * 1024 * 1024 + 1));
+    return;
+  }
   if (scenario === "dialog") {
     send({ type: "extension_ui_request", id: "approval", method: "confirm", title: "Approve", message: "Continue?" });
     return;
