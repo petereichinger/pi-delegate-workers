@@ -252,6 +252,7 @@ export type WorkerRoutingOptions = {
   model?: string | null;
   thinkingLevel?: ThinkingLevel | null;
   enforceTools?: boolean;
+  nestedDelegation?: boolean;
 };
 
 function removeOptions(args: string[], names: string[]): string[] {
@@ -275,7 +276,7 @@ export function buildWorkerArgs(
   routing: WorkerRoutingOptions = {},
 ): string[] {
   let extraArgs = splitExtraArgs(process.env.PI_DELEGATE_EXTRA_ARGS);
-  if (routing.enforceTools) {
+  if (routing.enforceTools || routing.nestedDelegation) {
     extraArgs = removeOptions(extraArgs, ["--tools", "-t"]);
   }
   if (routing.model !== undefined) {
@@ -286,6 +287,7 @@ export function buildWorkerArgs(
   }
 
   const args = ["--mode", "rpc", "--no-session", "--tools", tools.join(",")];
+  if (routing.nestedDelegation) args.push("--extension", fileURLToPath(new URL("./index.ts", import.meta.url)));
   const toolGuardExtension = resolveToolGuardExtension();
   if (toolGuardExtension && isEnabled(process.env.PI_DELEGATE_TOOL_GUARD_ISOLATE) && !hasNoExtensionsArg(extraArgs)) {
     args.push("--no-extensions");
@@ -310,6 +312,9 @@ export function createRpcWorker(options: {
   thinkingLevel?: ThinkingLevel | null;
   enforceTools?: boolean;
   coordinatorEndpoint?: string;
+  workerToken?: string;
+  workerDepth?: number;
+  maxDepth?: number;
   ui?: RpcUi;
   uiPrefix?: string;
   uiDialogQueue?: RpcUiDialogQueue;
@@ -327,11 +332,18 @@ export function createRpcWorker(options: {
       model: options.model,
       thinkingLevel: options.thinkingLevel,
       enforceTools: options.enforceTools,
+      nestedDelegation: options.maxDepth === 2 && options.workerDepth === 1 && options.tools.includes("delegate_tasks"),
     }),
     {
       cwd: options.cwd,
       stdio: ["pipe", "pipe", "pipe"],
-      ...(options.coordinatorEndpoint ? { env: { ...process.env, PI_DELEGATE_COORDINATOR_ENDPOINT: options.coordinatorEndpoint } } : {}),
+      ...(options.coordinatorEndpoint ? { env: {
+        ...process.env,
+        PI_DELEGATE_COORDINATOR_ENDPOINT: options.coordinatorEndpoint,
+        PI_DELEGATE_WORKER_TOKEN: options.workerToken,
+        PI_DELEGATE_WORKER_DEPTH: String(options.workerDepth),
+        PI_DELEGATE_MAX_DEPTH: String(options.maxDepth),
+      } } : {}),
     }
   );
 

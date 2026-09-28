@@ -3,20 +3,35 @@ import test from "node:test";
 import { Check } from "typebox/value";
 import delegateWorkersExtension from "../extensions/index.ts";
 
-test("workers cannot register nested delegation in step one", () => {
-  const previous = process.env.PI_DELEGATE_COORDINATOR_ENDPOINT;
-  process.env.PI_DELEGATE_COORDINATOR_ENDPOINT = "inherited-endpoint";
-  let registered = false;
+test("nesting is enabled at depth one by default, disabled at depth two or with max depth one", () => {
+  const names = ["PI_DELEGATE_COORDINATOR_ENDPOINT", "PI_DELEGATE_WORKER_TOKEN", "PI_DELEGATE_WORKER_DEPTH", "PI_DELEGATE_MAX_DEPTH"] as const;
+  const previous = names.map((name) => process.env[name]);
   try {
-    delegateWorkersExtension({
+    process.env.PI_DELEGATE_COORDINATOR_ENDPOINT = "inherited-endpoint";
+    process.env.PI_DELEGATE_WORKER_TOKEN = "worker-token";
+    delete process.env.PI_DELEGATE_MAX_DEPTH;
+    const tools: string[] = [];
+    const pi = {
       on: () => undefined,
-      registerCommand: () => { registered = true; },
-      registerTool: () => { registered = true; },
-    } as any);
-    assert.equal(registered, false);
+      registerCommand: () => undefined,
+      registerTool: (tool: { name: string }) => { tools.push(tool.name); },
+    } as any;
+    process.env.PI_DELEGATE_WORKER_DEPTH = "1";
+    delegateWorkersExtension(pi);
+    assert.deepEqual(tools, ["delegate_tasks"]);
+    process.env.PI_DELEGATE_WORKER_DEPTH = "2";
+    delegateWorkersExtension(pi);
+    assert.deepEqual(tools, ["delegate_tasks"]);
+    process.env.PI_DELEGATE_WORKER_DEPTH = "1";
+    process.env.PI_DELEGATE_MAX_DEPTH = "1";
+    delegateWorkersExtension(pi);
+    assert.deepEqual(tools, ["delegate_tasks"]);
   } finally {
-    if (previous === undefined) delete process.env.PI_DELEGATE_COORDINATOR_ENDPOINT;
-    else process.env.PI_DELEGATE_COORDINATOR_ENDPOINT = previous;
+    for (const [index, name] of names.entries()) {
+      const value = previous[index];
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
   }
 });
 

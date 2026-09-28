@@ -9,7 +9,13 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { createWorkerCoordinator, type WorkerCoordinator } from "./coordinator.ts";
+import {
+  acquireWorkerSlot,
+  createWorkerCoordinator,
+  resumeWorkerSlot,
+  yieldWorkerSlot,
+  type WorkerCoordinator,
+} from "./coordinator.ts";
 import {
   delegateConfigLoader,
   PROFILE_NAMES,
@@ -115,16 +121,28 @@ const DEFAULT_TOOLS = ["read", "write", "edit", "bash"];
 const DEFAULT_MAX_WORKERS = 5;
 const DEFAULT_MAX_ACTIVE_WORKERS = 10;
 const DEFAULT_MAX_LIVE_WORKERS = 30;
+
+function getMaxDepth(): 1 | 2 {
+  const value = process.env.PI_DELEGATE_MAX_DEPTH?.trim();
+  if (value === undefined || value === "" || value === "2") return 2;
+  if (value === "1") return 1;
+  throw new Error("PI_DELEGATE_MAX_DEPTH must be 1 or 2");
+}
+
+function getDepth(): number {
+  return Number(process.env.PI_DELEGATE_WORKER_DEPTH ?? "0");
+}
 const MAX_TIMEOUT_MS = 2_147_483_647;
 
 function getWorkerTools(): string[] {
   const raw = process.env.PI_DELEGATE_TOOLS?.trim();
-  if (!raw) return DEFAULT_TOOLS;
-  const tools = raw
-    .split(",")
-    .map((tool) => tool.trim())
-    .filter(Boolean);
-  return tools.length > 0 ? tools : DEFAULT_TOOLS;
+  const defaultTools = getMaxDepth() === 2 && getDepth() + 1 < 2
+    ? [...DEFAULT_TOOLS, "delegate_tasks"]
+    : DEFAULT_TOOLS;
+  if (!raw) return defaultTools;
+  const tools = raw.split(",").map((tool) => tool.trim()).filter(Boolean);
+  return (tools.length > 0 ? tools : defaultTools)
+    .filter((tool) => tool !== "delegate_tasks" || getMaxDepth() === 2 && getDepth() + 1 < 2);
 }
 
 function positiveLimit(name: string, fallback: number): number {
@@ -146,6 +164,7 @@ function getCoordinatorLimits() {
   return {
     maxActive: positiveLimit("PI_DELEGATE_MAX_ACTIVE_WORKERS", DEFAULT_MAX_ACTIVE_WORKERS),
     maxLive: positiveLimit("PI_DELEGATE_MAX_LIVE_WORKERS", DEFAULT_MAX_LIVE_WORKERS),
+    maxDepth: getMaxDepth(),
   };
 }
 
@@ -424,6 +443,9 @@ export async function runTask(
     createWorker?: typeof createRpcWorker;
     widgetRefresh?: WidgetRefresh<ExtensionContext>;
     coordinatorEndpoint?: string;
+    workerDepth?: number;
+    workerToken?: string;
+    maxDepth?: number;
   },
 ): Promise<DelegatedResult> {
   const abortController = new AbortController();
@@ -445,6 +467,9 @@ export async function runTask(
     uiDialogQueue: options.uiDialogQueue,
     reportInputStatus: options.reportInputStatus,
     coordinatorEndpoint: options.coordinatorEndpoint,
+    workerDepth: options.workerDepth,
+    workerToken: options.workerToken,
+    maxDepth: options.maxDepth,
   });
   const updateWidget = (scheduled = false) => {
     if (!options.widgetRefresh) {
@@ -649,6 +674,9 @@ export async function scheduleTask(
     reportInputStatus: (active: boolean, label?: string) => void;
     createWorker?: typeof createRpcWorker;
     widgetRefresh?: WidgetRefresh<ExtensionContext>;
+    depth?: number;
+    parentToken?: string;
+    maxDepth?: number;
   },
 ): Promise<DelegatedResult> {
   const startedWaiting = Date.now();
@@ -672,7 +700,7 @@ export async function scheduleTask(
     abortController.signal,
   ]);
   try {
-    const slot = await coordinator.acquire(signal);
+    const slot = await coordinator.acquire(signal, options.depth ?? 1, options.parentToken);
     const queueWaitMs = Date.now() - startedWaiting;
     queued.delete(id);
     try {
@@ -680,6 +708,9 @@ export async function scheduleTask(
       const result = await runTask(ctx, workers, task, id, {
         ...options,
         coordinatorEndpoint: coordinator.endpoint,
+        workerDepth: options.depth ?? 1,
+        workerToken: slot.token,
+        maxDepth: options.maxDepth ?? 2,
         signal: AbortSignal.any([signal, slot.signal]),
       });
       return { ...result, queueWaitMs };
@@ -714,19 +745,57 @@ export async function scheduleTask(
 }
 
 export default function delegateWorkersExtension(pi: ExtensionAPI) {
-  if (process.env.PI_DELEGATE_COORDINATOR_ENDPOINT) return;
+  const inheritedEndpoint = process.env.PI_DELEGATE_COORDINATOR_ENDPOINT;
+  const depth = getDepth();
+  const maxDepth = getMaxDepth();
+  if (inheritedEndpoint && (depth < 1 || depth >= maxDepth || !process.env.PI_DELEGATE_WORKER_TOKEN)) return;
 
   const workers = new Map<string, WorkerState>();
   const queued = new Map<string, QueuedWorkerState>();
   const widgetRefresh = createWidgetRefresh((ctx: ExtensionContext) => refreshUi(ctx, workers, queued));
   let coordinator: Promise<WorkerCoordinator> | undefined;
-  const getCoordinator = () => coordinator ??= createWorkerCoordinator(getCoordinatorLimits());
+  const inheritedCoordinator: WorkerCoordinator | undefined = inheritedEndpoint ? {
+    endpoint: inheritedEndpoint,
+    acquire: (signal, childDepth, parentToken) => acquireWorkerSlot(inheritedEndpoint, signal, childDepth, parentToken),
+    close: async () => undefined,
+  } : undefined;
+  const getCoordinator = () => inheritedCoordinator
+    ? Promise.resolve(inheritedCoordinator)
+    : coordinator ??= createWorkerCoordinator(getCoordinatorLimits());
   const closeCoordinator = async () => {
     const current = coordinator;
     coordinator = undefined;
-    if (current) await (await current).close();
+    if (current && !inheritedEndpoint) await (await current).close();
   };
   const uiDialogQueue = createRpcUiDialogQueue();
+  const activeTools = new Set<string>();
+  const toolChanged = new Set<() => void>();
+  let nestedCallActive = false;
+  pi.on("tool_execution_start", (event) => {
+    activeTools.add(event.toolCallId);
+    for (const notify of toolChanged) notify();
+  });
+  pi.on("tool_execution_end", (event) => {
+    activeTools.delete(event.toolCallId);
+    for (const notify of toolChanged) notify();
+  });
+  const waitForOtherTools = async (toolCallId: string, signal?: AbortSignal) => {
+    if ([...activeTools].every((id) => id === toolCallId)) return;
+    await new Promise<void>((resolve, reject) => {
+      const check = () => {
+        if ([...activeTools].every((id) => id === toolCallId)) { cleanup(); resolve(); }
+      };
+      const abort = () => { cleanup(); reject(new Error("Nested delegation cancelled")); };
+      const cleanup = () => {
+        toolChanged.delete(check);
+        signal?.removeEventListener("abort", abort);
+      };
+      toolChanged.add(check);
+      signal?.addEventListener("abort", abort, { once: true });
+      if (signal?.aborted) abort();
+      else check();
+    });
+  };
   let nextWorkerId = 1;
   let inferredModelSetInitialized = false;
   let inferredModelSet: string | undefined;
@@ -867,7 +936,7 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
       Type.Array(Type.String({ minLength: 1 }), {
         minItems: 1,
         uniqueItems: true,
-        description: "Optional per-task tool subset of PI_DELEGATE_TOOLS (default: read,write,edit,bash).",
+        description: `Optional per-task tool subset of PI_DELEGATE_TOOLS (current default: ${getWorkerTools().join(",")}).`,
       }),
     ),
   });
@@ -883,8 +952,8 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
       "Use delegate_tasks for independent subtasks that can run in parallel.",
       "For delegate_tasks, select profile fast for lookups, searches, summaries, and isolated checks; balanced for multi-file tracing, routine changes, and test diagnosis; deep for architecture, security, migrations, and ambiguous root causes.",
       "For delegate_tasks, leave modelSet out of each task unless the user requests a configured routing override or an independent model family. The tool selects the model set from the active parent model automatically.",
-      "Workers use pi's normal tool set by default (read, write, edit, bash), and can be reconfigured via PI_DELEGATE_TOOLS.",
-      "Use a task's tools field for a read-only subset of the configured worker tool allowlist. PI_DELEGATE_TOOLS sets the maximum available tools (default: read,write,edit,bash).",
+      "Depth-one workers can delegate once by default. Set PI_DELEGATE_MAX_DEPTH=1 to disable nesting; PI_DELEGATE_TOOLS can restrict worker tools.",
+      "Use a task's tools field for a read-only subset of the worker tool allowlist. The default for depth-one workers is read,write,edit,bash,delegate_tasks; depth-two workers cannot delegate.",
     ],
     parameters: Type.Object({
       tasks: Type.Array(taskSchema, {
@@ -897,7 +966,7 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
         }),
       ),
     }),
-    async execute(_toolCallId, params, signal, onUpdate, ctx) {
+    async execute(toolCallId, params, signal, onUpdate, ctx) {
       const maxWorkers = getMaxWorkers();
       if (params.tasks.length > maxWorkers) {
         throw new Error(`Too many tasks. Max is ${maxWorkers}.`);
@@ -916,17 +985,37 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
       });
 
       const scheduler = await getCoordinator();
-      const results = await Promise.all(
-        tasks.map((task) =>
-          scheduleTask(ctx, workers, queued, scheduler, task, makeWorkerId(), {
-            signal,
-            sharedContext: params.sharedContext,
-            uiDialogQueue,
-            reportInputStatus,
-            widgetRefresh,
-          }),
-        ),
-      );
+      if (inheritedEndpoint && nestedCallActive) throw new Error("Only one nested delegate_tasks call may run at a time");
+      if (inheritedEndpoint) nestedCallActive = true;
+      let yielded = false;
+      let results: DelegatedResult[];
+      try {
+        if (inheritedEndpoint) {
+          await waitForOtherTools(toolCallId, signal);
+          await yieldWorkerSlot(inheritedEndpoint, process.env.PI_DELEGATE_WORKER_TOKEN!, signal);
+          yielded = true;
+        }
+        results = await Promise.all(
+          tasks.map((task) =>
+            scheduleTask(ctx, workers, queued, scheduler, task, makeWorkerId(), {
+              signal,
+              sharedContext: params.sharedContext,
+              uiDialogQueue,
+              reportInputStatus,
+              widgetRefresh,
+              depth: depth + 1,
+              parentToken: inheritedEndpoint ? process.env.PI_DELEGATE_WORKER_TOKEN : undefined,
+              maxDepth,
+            }),
+          ),
+        );
+      } finally {
+        try {
+          if (yielded) await resumeWorkerSlot(inheritedEndpoint!, process.env.PI_DELEGATE_WORKER_TOKEN!, signal);
+        } finally {
+          if (inheritedEndpoint) nestedCallActive = false;
+        }
+      }
 
       const combined = formatResults(results);
       const failed = results.filter((result) => !result.ok).length;

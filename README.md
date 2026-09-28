@@ -10,6 +10,7 @@ It launches separate `pi --mode rpc` worker processes, runs configured tasks in 
 - `/cancel-worker 13` to cancel the running worker shown as `w13` in the live widget (the `w13` form is also accepted)
 - optional per-task deadlines covering investigation and synthesis after a worker starts; tasks have no timeout by default
 - session-wide coordinator queues tasks across overlapping calls and limits concurrently active workers
+- one-level nested delegation by default, with a shared coordinator and descendant cancellation
 - per-profile model and thinking level configuration
 - automatic model-set selection from the active parent model
 - per-task model-set overrides for aligned or cross-model delegation
@@ -18,7 +19,7 @@ It launches separate `pi --mode rpc` worker processes, runs configured tasks in 
 - progress text and current tool activity streamed from each worker over RPC
 - per-worker synthesis before returning results to the parent
 - worker token and cost usage added to the parent session totals
-- normal pi worker tool set by default (`read,write,edit,bash`), with optional per-task subsets
+- normal pi worker tools plus `delegate_tasks` for depth-one workers by default; depth-two workers cannot delegate; optional per-task tool subsets
 
 The parent agent selects profiles using this rubric:
 
@@ -156,7 +157,7 @@ The profile is optional and falls back to `defaultProfile`. Leave `modelSet` out
 
 `timeoutMs` is optional per task and must be an integer from 1 to 2,147,483,647 milliseconds. It covers both the investigation and synthesis passes, starting when the worker is launched, not while it waits in the queue. Without it, the task has no deadline. An expired task stops its worker process and reports `timed out` separately from cancellation and other errors; usage recorded before expiry is still included.
 
-`tools` is an optional non-empty array of distinct tool names for one task. It must be a subset of `PI_DELEGATE_TOOLS` (or the default `read,write,edit,bash`). For example, `"tools": ["read"]` limits one worker to reading while other workers retain the configured tools. To allow search tools in a subset, first add them to `PI_DELEGATE_TOOLS`, such as `read,write,edit,bash,grep,find,ls`. Omitting `tools` preserves the current worker behavior.
+`tools` is an optional non-empty array of distinct tool names for one task. It must be a subset of `PI_DELEGATE_TOOLS` (or the default `read,write,edit,bash,delegate_tasks` for depth-one workers; depth-two workers cannot delegate). For example, `"tools": ["read"]` limits one worker to reading while other workers retain the configured tools. To allow search tools in a subset, first add them to `PI_DELEGATE_TOOLS`, such as `read,write,edit,bash,grep,find,ls`. Omitting `tools` preserves the current worker behavior.
 
 Each worker starts with the resolved profile on its command line:
 
@@ -169,22 +170,23 @@ The same model and thinking level are used for investigation and the worker's sy
 ## Environment settings
 
 - `PI_DELEGATE_PI_BIN` — worker pi binary/path (default: `pi`)
-- `PI_DELEGATE_TOOLS` — comma-separated worker tool allowlist (default: `read,write,edit,bash`)
+- `PI_DELEGATE_TOOLS` — comma-separated worker tool allowlist (default: `read,write,edit,bash,delegate_tasks` at depth one; `read,write,edit,bash` at depth two)
 - `PI_DELEGATE_MAX_WORKERS` — maximum tasks per batch (default: `5`)
 - `PI_DELEGATE_MAX_ACTIVE_WORKERS` — maximum concurrently working delegated workers in one parent session (default: `10`)
-- `PI_DELEGATE_MAX_LIVE_WORKERS` — maximum live worker processes in one parent session (default: `30`; must be at least the active limit)
+- `PI_DELEGATE_MAX_LIVE_WORKERS` — maximum live worker processes in one parent session (default: `30`; must be at least the active limit, and at least `2` for nesting)
+- `PI_DELEGATE_MAX_DEPTH` — maximum delegation depth: `2` (default; allow one nested level) or `1` (disable nesting)
 - `PI_DELEGATE_EXTRA_ARGS` — additional worker CLI arguments
 - `PI_DELEGATE_TOOL_GUARD` — tool-guard auto-loading mode; set `0`/`false` to disable or `1`/`required` to force
 - `PI_DELEGATE_TOOL_GUARD_EXTENSION` — explicit tool-guard extension source/path
 - `PI_DELEGATE_TOOL_GUARD_ISOLATE` — set to `1`/`true` to add `--no-extensions` when explicitly loading tool-guard (default: off); enabling isolation also disables other discovered worker extensions, including custom model providers
-- `PI_DELEGATE_COORDINATOR_ENDPOINT` — internal: the parent sets this on spawned workers to identify its session coordinator; do not set it manually
+- `PI_DELEGATE_COORDINATOR_ENDPOINT`, `PI_DELEGATE_WORKER_TOKEN`, `PI_DELEGATE_WORKER_DEPTH` — internal: inherited by workers to use the parent's coordinator; do not set them manually
 
 When a resolved profile controls the model or thinking level, conflicting `--provider`, `--model`, and `--thinking` entries are removed from `PI_DELEGATE_EXTRA_ARGS`. When a task specifies `tools`, conflicting `--tools` entries are also removed so extra arguments cannot widen its subset. Other extra arguments remain.
 
 ## Notes
 
 - Workers run in the same CWD as the main session.
-- The session coordinator uses a private local socket (a named pipe on Windows). Workers inherit its endpoint for future shared scheduling, but the extension does not register `delegate_tasks` inside workers yet, even if the worker tool allowlist names it. The active and live limits both count launched workers in this release; the separate live limit provides room for waiting parent workers when nesting is added. Queued tasks appear in the live widget and can be cancelled with `/cancel-worker <id>`. Results include `queue_wait_ms`. Closing the session stops its coordinator and workers.
+- The session coordinator uses a private local socket (a named pipe on Windows). By default depth-one workers can call `delegate_tasks`. Set `PI_DELEGATE_MAX_DEPTH=1` to disable nesting. The default worker tool allowlist includes `delegate_tasks` at depth one; an explicit `PI_DELEGATE_TOOLS` or per-task `tools` list must include it to allow delegation. Depth-two workers cannot delegate. An active worker counts toward both limits; one waiting for children keeps its live-process slot but releases its active slot until its children finish. Root workers reserve one live-process slot for children, so the live-process cap cannot prevent all nested work. Cancelling a parent stops its queued and running descendants. Parallel nested `delegate_tasks` calls in the same worker are rejected; other tool calls must finish before that worker releases its active slot. Top-level queued tasks appear in the parent's live widget and can be cancelled with `/cancel-worker <id>`. Nested tasks appear in their worker's tool result; cancelling a top-level parent also cancels its descendants. Results include `queue_wait_ms`. Closing the session stops its coordinator and workers.
 - Worker stderr retained for error reports is limited to its last 8,192 characters. Error messages indicate when earlier stderr was truncated.
 - RPC stdout records are limited to 16 MiB each. An oversized record stops that worker and returns a protocol error instead of leaving its task waiting for completion.
 - A worker cannot start another prompt until an aborted prompt has settled. Task cancellation and deadlines dispose the worker process.

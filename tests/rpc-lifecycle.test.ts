@@ -252,6 +252,37 @@ test("disposing a worker dismisses its open dialog and releases the shared queue
   }
 });
 
+test("nested workers inherit coordinator identity, but depth-two workers cannot delegate", { timeout: 5000 }, async () => {
+  const previousGuard = process.env.PI_DELEGATE_TOOL_GUARD;
+  process.env.PI_DELEGATE_TOOL_GUARD = "0";
+  const launches: Array<{ args: string[]; env?: NodeJS.ProcessEnv }> = [];
+  const spawnWorker = (_bin: string, args: string[], options: { cwd: string; stdio: ["pipe", "pipe", "pipe"]; env?: NodeJS.ProcessEnv }) => {
+    launches.push({ args, env: options.env });
+    return spawn(process.execPath, [fixture, "stall"], options);
+  };
+  const parent = createRpcWorker({
+    cwd: process.cwd(), tools: ["read", "delegate_tasks"], coordinatorEndpoint: "endpoint",
+    workerToken: "token-one", workerDepth: 1, maxDepth: 2, spawnWorker,
+  });
+  const child = createRpcWorker({
+    cwd: process.cwd(), tools: ["read"], coordinatorEndpoint: "endpoint",
+    workerToken: "token-two", workerDepth: 2, maxDepth: 2, spawnWorker,
+  });
+  try {
+    assert.equal(launches[0]!.args.includes("--extension"), true);
+    assert.equal(launches[1]!.args.includes("--extension"), false);
+    assert.equal(launches[0]!.env?.PI_DELEGATE_WORKER_DEPTH, "1");
+    assert.equal(launches[1]!.env?.PI_DELEGATE_WORKER_DEPTH, "2");
+    assert.equal(launches[0]!.env?.PI_DELEGATE_WORKER_TOKEN, "token-one");
+    assert.equal(launches[1]!.env?.PI_DELEGATE_WORKER_TOKEN, "token-two");
+  } finally {
+    parent.dispose();
+    child.dispose();
+    if (previousGuard === undefined) delete process.env.PI_DELEGATE_TOOL_GUARD;
+    else process.env.PI_DELEGATE_TOOL_GUARD = previousGuard;
+  }
+});
+
 test("RPC dialog is forwarded and its response reaches the worker", { timeout: 5000 }, async () => {
   const statuses: boolean[] = [];
   const worker = fakeWorker("dialog", {

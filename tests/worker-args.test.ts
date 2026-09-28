@@ -93,6 +93,20 @@ test("explicit task tools cannot be overridden by extra CLI arguments", () => {
   );
 });
 
+test("nested delegation explicitly loads the extension and prevents extra tools from replacing it", () => {
+  withEnvironment({
+    PI_DELEGATE_TOOL_GUARD: "0",
+    PI_DELEGATE_EXTRA_ARGS: "--tools=read --offline",
+  }, () => {
+    const args = buildWorkerArgs(["read", "delegate_tasks"], { nestedDelegation: true });
+    assert.equal(args.includes("--extension"), true);
+    assert.match(args[args.indexOf("--extension") + 1]!, /extensions[/\\\\]index\.ts$/);
+    assert.deepEqual(args.slice(0, 5), ["--mode", "rpc", "--no-session", "--tools", "read,delegate_tasks"]);
+    assert.equal(args.includes("--tools=read"), false);
+    assert.equal(args.includes("--offline"), true);
+  });
+});
+
 test("keeps extension discovery enabled unless tool-guard isolation is explicit", () => {
   withEnvironment(
     {

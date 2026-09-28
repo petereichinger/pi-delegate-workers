@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import test from "node:test";
-import { createWorkerCoordinator, acquireWorkerSlot } from "../extensions/coordinator.ts";
+import {
+  createWorkerCoordinator,
+  acquireWorkerSlot,
+  resumeWorkerSlot,
+  yieldWorkerSlot,
+} from "../extensions/coordinator.ts";
 import { scheduleTask } from "../extensions/index.ts";
 import { emptyUsage } from "../extensions/rpc-worker.ts";
 import { createRpcUiDialogQueue } from "../extensions/ui-dialog-queue.ts";
@@ -79,6 +84,64 @@ process.stdin.on("end", () => { slot.release(); process.exit(0); });`;
     slot.release();
   } finally {
     child.kill();
+    await coordinator.close();
+  }
+});
+
+test("waiting parent releases active capacity but retains live capacity", { timeout: 5000 }, async () => {
+  const coordinator = await createWorkerCoordinator({ maxActive: 1, maxLive: 2, maxDepth: 2 });
+  try {
+    const parent = await coordinator.acquire(undefined, 1);
+    const otherRoot = coordinator.acquire();
+    await yieldWorkerSlot(coordinator.endpoint, parent.token);
+    const child = await coordinator.acquire(undefined, 2, parent.token);
+    const resuming = resumeWorkerSlot(coordinator.endpoint, parent.token);
+    child.release();
+    await resuming;
+    const abort = new AbortController();
+    abort.abort();
+    await assert.rejects(coordinator.acquire(abort.signal, 2, parent.token), /cancelled/);
+    parent.release();
+    const root = await otherRoot;
+    root.release();
+  } finally {
+    await coordinator.close();
+  }
+});
+
+test("parent disconnect cancels descendants and queued children", { timeout: 5000 }, async () => {
+  const coordinator = await createWorkerCoordinator({ maxActive: 2, maxLive: 2, maxDepth: 2 });
+  try {
+    const parent = await coordinator.acquire();
+    const child = await coordinator.acquire(undefined, 2, parent.token);
+    const queued = coordinator.acquire(undefined, 2, parent.token);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    parent.release();
+    await assert.rejects(queued, /connection closed|Invalid worker coordinator response/);
+    await new Promise<void>((resolve) => {
+      if (child.signal.aborted) resolve();
+      else child.signal.addEventListener("abort", () => resolve(), { once: true });
+    });
+    const root = await coordinator.acquire();
+    root.release();
+  } finally {
+    await coordinator.close();
+  }
+});
+
+test("live-process reserve prevents waiting roots from blocking their children", { timeout: 5000 }, async () => {
+  const coordinator = await createWorkerCoordinator({ maxActive: 2, maxLive: 2, maxDepth: 2 });
+  try {
+    const first = await coordinator.acquire();
+    const second = coordinator.acquire();
+    await yieldWorkerSlot(coordinator.endpoint, first.token);
+    const child = await coordinator.acquire(undefined, 2, first.token);
+    await yieldWorkerSlot(coordinator.endpoint, child.token);
+    child.release();
+    first.release();
+    const root = await second;
+    root.release();
+  } finally {
     await coordinator.close();
   }
 });
