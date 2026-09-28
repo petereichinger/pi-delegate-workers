@@ -309,6 +309,7 @@ export function createRpcWorker(options: {
   model?: string | null;
   thinkingLevel?: ThinkingLevel | null;
   enforceTools?: boolean;
+  coordinatorEndpoint?: string;
   ui?: RpcUi;
   uiPrefix?: string;
   uiDialogQueue?: RpcUiDialogQueue;
@@ -316,7 +317,7 @@ export function createRpcWorker(options: {
   spawnWorker?: (
     bin: string,
     args: string[],
-    options: { cwd: string; stdio: ["pipe", "pipe", "pipe"] },
+    options: { cwd: string; stdio: ["pipe", "pipe", "pipe"]; env?: NodeJS.ProcessEnv },
   ) => ChildProcessWithoutNullStreams;
 }): RpcWorker {
   const bin = process.env.PI_DELEGATE_PI_BIN || "pi";
@@ -330,6 +331,7 @@ export function createRpcWorker(options: {
     {
       cwd: options.cwd,
       stdio: ["pipe", "pipe", "pipe"],
+      ...(options.coordinatorEndpoint ? { env: { ...process.env, PI_DELEGATE_COORDINATOR_ENDPOINT: options.coordinatorEndpoint } } : {}),
     }
   );
 

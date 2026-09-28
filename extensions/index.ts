@@ -9,6 +9,7 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { createWorkerCoordinator, type WorkerCoordinator } from "./coordinator.ts";
 import {
   delegateConfigLoader,
   PROFILE_NAMES,
@@ -21,6 +22,7 @@ import {
   MAX_INVESTIGATION_TEXT_CHARS,
   MAX_SYNTHESIS_TEXT_CHARS,
   sumUsage,
+  emptyUsage,
   type RpcEvent,
   type RpcWorker,
 } from "./rpc-worker.ts";
@@ -65,9 +67,20 @@ type WorkerState = {
   cancelRequested: boolean;
 };
 
-type WorkerUiState = "starting" | "working" | "synthesizing" | "done" | "cancelled" | "timed out" | "error";
+type QueuedWorkerState = {
+  id: string;
+  task: string;
+  profile: ProfileName;
+  status: string;
+  latestMessage: string;
+  abortController: AbortController;
+  cancelRequested: boolean;
+};
+
+type WorkerUiState = "queued" | "starting" | "working" | "synthesizing" | "done" | "cancelled" | "timed out" | "error";
 
 const WORKER_STATE_STYLES = {
+  queued: { icon: "", fg: "muted" },
   starting: { icon: "", fg: "muted" },
   working: { icon: "", fg: "accent" },
   synthesizing: { icon: "", fg: "warning" },
@@ -94,11 +107,14 @@ type DelegatedResult = {
   rawOutput: string;
   summaryOutput: string;
   durationMs: number;
+  queueWaitMs?: number;
   usage: Usage;
 };
 
 const DEFAULT_TOOLS = ["read", "write", "edit", "bash"];
 const DEFAULT_MAX_WORKERS = 5;
+const DEFAULT_MAX_ACTIVE_WORKERS = 10;
+const DEFAULT_MAX_LIVE_WORKERS = 30;
 const MAX_TIMEOUT_MS = 2_147_483_647;
 
 function getWorkerTools(): string[] {
@@ -111,11 +127,26 @@ function getWorkerTools(): string[] {
   return tools.length > 0 ? tools : DEFAULT_TOOLS;
 }
 
+function positiveLimit(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${name} must be a positive integer`);
+  return value;
+}
+
 function getMaxWorkers(): number {
   const raw = Number(process.env.PI_DELEGATE_MAX_WORKERS);
   return Number.isFinite(raw) && raw > 0
     ? Math.floor(raw)
     : DEFAULT_MAX_WORKERS;
+}
+
+function getCoordinatorLimits() {
+  return {
+    maxActive: positiveLimit("PI_DELEGATE_MAX_ACTIVE_WORKERS", DEFAULT_MAX_ACTIVE_WORKERS),
+    maxLive: positiveLimit("PI_DELEGATE_MAX_LIVE_WORKERS", DEFAULT_MAX_LIVE_WORKERS),
+  };
 }
 
 export function normalizeWorkerId(text: string): string | undefined {
@@ -304,6 +335,7 @@ function formatResults(results: DelegatedResult[]): string {
         `thinking: ${configuredValue(result.thinkingLevel)}`,
         ...(result.tools === undefined ? [] : [`tools: ${result.tools.join(",")}`]),
         `duration_ms: ${result.durationMs}`,
+        ...(result.queueWaitMs === undefined ? [] : [`queue_wait_ms: ${result.queueWaitMs}`]),
         ...(result.timeoutMs === undefined ? [] : [`timeout_ms: ${result.timeoutMs}`]),
         "",
         body,
@@ -313,6 +345,7 @@ function formatResults(results: DelegatedResult[]): string {
 }
 
 function getWorkerUiState(status: string): WorkerUiState {
+  if (status === "queued") return "queued";
   if (status === "synthesizing") return "synthesizing";
   if (status === "done") return "done";
   if (status === "cancelled") return "cancelled";
@@ -357,18 +390,24 @@ export function formatWorkerDisplayLines(
   ];
 }
 
-function refreshUi(ctx: ExtensionContext, workers: Map<string, WorkerState>) {
-  if (workers.size === 0) {
+function refreshUi(
+  ctx: ExtensionContext,
+  workers: Map<string, WorkerState>,
+  queued: Map<string, QueuedWorkerState> = new Map(),
+) {
+  if (workers.size === 0 && queued.size === 0) {
     ctx.ui.setWidget("delegate-workers", undefined);
     return;
   }
 
-  const widgetLines = [...workers.values()].flatMap((worker) => {
-    const uiState = getWorkerUiState(worker.status);
-    const style = WORKER_STATE_STYLES[uiState];
-    const label = ctx.ui.theme.fg(style.fg, `${style.icon} ${worker.id} [${worker.profile}]`);
-    return formatWorkerDisplayLines(label, worker.task, worker.latestMessage);
-  });
+  const widgetLines = [...workers.values(), ...queued.values()]
+    .sort((a, b) => Number(a.id.slice(1)) - Number(b.id.slice(1)))
+    .flatMap((worker) => {
+      const uiState = getWorkerUiState(worker.status);
+      const style = WORKER_STATE_STYLES[uiState];
+      const label = ctx.ui.theme.fg(style.fg, `${style.icon} ${worker.id} [${worker.profile}]`);
+      return formatWorkerDisplayLines(label, worker.task, worker.latestMessage);
+    });
   ctx.ui.setWidget("delegate-workers", widgetLines, { placement: "aboveEditor" });
 }
 
@@ -384,6 +423,7 @@ export async function runTask(
     reportInputStatus: (active: boolean, label?: string) => void;
     createWorker?: typeof createRpcWorker;
     widgetRefresh?: WidgetRefresh<ExtensionContext>;
+    coordinatorEndpoint?: string;
   },
 ): Promise<DelegatedResult> {
   const abortController = new AbortController();
@@ -404,6 +444,7 @@ export async function runTask(
     uiPrefix: id,
     uiDialogQueue: options.uiDialogQueue,
     reportInputStatus: options.reportInputStatus,
+    coordinatorEndpoint: options.coordinatorEndpoint,
   });
   const updateWidget = (scheduled = false) => {
     if (!options.widgetRefresh) {
@@ -594,9 +635,97 @@ export async function runTask(
   }
 }
 
+export async function scheduleTask(
+  ctx: ExtensionContext,
+  workers: Map<string, WorkerState>,
+  queued: Map<string, QueuedWorkerState>,
+  coordinator: WorkerCoordinator,
+  task: RoutedTask,
+  id: string,
+  options: {
+    signal?: AbortSignal;
+    sharedContext?: string;
+    uiDialogQueue: RpcUiDialogQueue;
+    reportInputStatus: (active: boolean, label?: string) => void;
+    createWorker?: typeof createRpcWorker;
+    widgetRefresh?: WidgetRefresh<ExtensionContext>;
+  },
+): Promise<DelegatedResult> {
+  const startedWaiting = Date.now();
+  const abortController = new AbortController();
+  const state: QueuedWorkerState = {
+    id,
+    task: task.task,
+    profile: task.profile,
+    status: "queued",
+    latestMessage: "Waiting for a worker slot",
+    abortController,
+    cancelRequested: false,
+  };
+  queued.set(id, state);
+  const updateWidget = () => options.widgetRefresh
+    ? options.widgetRefresh.immediate(ctx)
+    : refreshUi(ctx, workers, queued);
+  updateWidget();
+  const signal = AbortSignal.any([
+    ...(options.signal ? [options.signal] : []),
+    abortController.signal,
+  ]);
+  try {
+    const slot = await coordinator.acquire(signal);
+    const queueWaitMs = Date.now() - startedWaiting;
+    queued.delete(id);
+    try {
+      if (signal.aborted || slot.signal.aborted) throw new Error("Worker slot request cancelled");
+      const result = await runTask(ctx, workers, task, id, {
+        ...options,
+        coordinatorEndpoint: coordinator.endpoint,
+        signal: AbortSignal.any([signal, slot.signal]),
+      });
+      return { ...result, queueWaitMs };
+    } finally {
+      slot.release();
+    }
+  } catch (error) {
+    return {
+      id,
+      task: task.task,
+      timeoutMs: task.timeoutMs,
+      tools: task.tools,
+      profile: task.profile,
+      modelSet: task.modelSet,
+      modelSetSource: task.modelSetSource,
+      model: task.model,
+      thinkingLevel: task.thinkingLevel,
+      ok: false,
+      cancelled: signal.aborted,
+      timedOut: false,
+      output: signal.aborted ? `Worker ${id} was cancelled before launch.` : error instanceof Error ? error.message : String(error),
+      rawOutput: "",
+      summaryOutput: "",
+      durationMs: 0,
+      queueWaitMs: Date.now() - startedWaiting,
+      usage: emptyUsage(),
+    };
+  } finally {
+    queued.delete(id);
+    updateWidget();
+  }
+}
+
 export default function delegateWorkersExtension(pi: ExtensionAPI) {
+  if (process.env.PI_DELEGATE_COORDINATOR_ENDPOINT) return;
+
   const workers = new Map<string, WorkerState>();
-  const widgetRefresh = createWidgetRefresh((ctx: ExtensionContext) => refreshUi(ctx, workers));
+  const queued = new Map<string, QueuedWorkerState>();
+  const widgetRefresh = createWidgetRefresh((ctx: ExtensionContext) => refreshUi(ctx, workers, queued));
+  let coordinator: Promise<WorkerCoordinator> | undefined;
+  const getCoordinator = () => coordinator ??= createWorkerCoordinator(getCoordinatorLimits());
+  const closeCoordinator = async () => {
+    const current = coordinator;
+    coordinator = undefined;
+    if (current) await (await current).close();
+  };
   const uiDialogQueue = createRpcUiDialogQueue();
   let nextWorkerId = 1;
   let inferredModelSetInitialized = false;
@@ -625,6 +754,10 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
   };
 
   pi.on("session_start", async (_event, ctx) => {
+    for (const state of queued.values()) requestWorkerCancellation(state);
+    queued.clear();
+    for (const state of workers.values()) requestWorkerCancellation(state);
+    await closeCoordinator();
     widgetRefresh.immediate(ctx);
     delegateConfigLoader.invalidate();
     try {
@@ -662,17 +795,21 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async () => {
     widgetRefresh.cancel();
+    for (const state of queued.values()) requestWorkerCancellation(state);
+    queued.clear();
     for (const worker of workers.values()) {
+      requestWorkerCancellation(worker);
       worker.worker.dispose();
     }
     workers.clear();
+    await closeCoordinator();
   });
 
   pi.registerCommand("cancel-worker", {
     description: "Cancel one running delegate worker by ID",
     getArgumentCompletions: (prefix) => {
       const normalizedPrefix = prefix.trim().toLowerCase();
-      const items = [...workers.keys()]
+      const items = [...workers.keys(), ...queued.keys()]
         .filter((id) =>
           id.toLowerCase().startsWith(normalizedPrefix) ||
           id.slice(1).startsWith(normalizedPrefix)
@@ -687,13 +824,13 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
         return;
       }
 
-      const state = workers.get(id);
+      const state = workers.get(id) ?? queued.get(id);
       if (!state || state.cancelRequested) {
-        const active = [...workers.keys()];
+        const active = [...workers.keys(), ...queued.keys()];
         const suffix = active.length > 0
           ? ` Active workers: ${active.join(", ")}.`
           : " No workers are currently running.";
-        ctx.ui.notify(`Worker ${id} is not running.${suffix}`, "warning");
+        ctx.ui.notify(`Worker ${id} is not available for cancellation.${suffix}`, "warning");
         return;
       }
 
@@ -772,15 +909,16 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
         content: [
           {
             type: "text",
-            text: `Launching ${tasks.length} delegate worker(s)...`,
+            text: `Scheduling ${tasks.length} delegate worker(s)...`,
           },
         ],
         details: {},
       });
 
+      const scheduler = await getCoordinator();
       const results = await Promise.all(
         tasks.map((task) =>
-          runTask(ctx, workers, task, makeWorkerId(), {
+          scheduleTask(ctx, workers, queued, scheduler, task, makeWorkerId(), {
             signal,
             sharedContext: params.sharedContext,
             uiDialogQueue,
@@ -812,6 +950,7 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
             model: result.model,
             thinkingLevel: result.thinkingLevel,
             timeoutMs: result.timeoutMs,
+            queueWaitMs: result.queueWaitMs,
             tools: result.tools,
             usage: result.usage,
           })),
