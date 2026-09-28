@@ -1,6 +1,6 @@
 {
   "name": "pi-delegate-workers",
-  "version": "0.11.6",
+  "version": "0.12.0",
   "private": true,
   "description": "Pi extension that delegates configured tasks to parallel pi RPC workers.",
   "keywords": [
