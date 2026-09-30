@@ -69,6 +69,9 @@ function receive(record) {
     send({ type: "extension_ui_request", id: "approval", method: "confirm", title: "Approve", message: "Continue?" });
     return;
   }
+  if (scenario === "widget") {
+    send({ type: "extension_ui_request", id: `widget-${prompts}`, method: "setWidget", widgetKey: "delegate-workers", widgetLines: prompts === 1 ? ["w1.1 Goal: child", "  Now: running"] : undefined });
+  }
   if (prompts === 1) process.stdout.write("not-json\n");
   finish(prompts === 1 ? `first:\u2028${"x".repeat(50)}` : "summary");
 }

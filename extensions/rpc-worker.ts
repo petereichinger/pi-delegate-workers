@@ -317,6 +317,7 @@ export function createRpcWorker(options: {
   maxDepth?: number;
   ui?: RpcUi;
   uiPrefix?: string;
+  onDelegateWidget?: (lines?: string[]) => void;
   uiDialogQueue?: RpcUiDialogQueue;
   reportInputStatus?: (active: boolean, label?: string) => void;
   spawnWorker?: (
@@ -341,6 +342,7 @@ export function createRpcWorker(options: {
         ...process.env,
         PI_DELEGATE_COORDINATOR_ENDPOINT: options.coordinatorEndpoint,
         PI_DELEGATE_WORKER_TOKEN: options.workerToken,
+        PI_DELEGATE_PARENT_WORKER_ID: options.uiPrefix,
         PI_DELEGATE_WORKER_DEPTH: String(options.workerDepth),
         PI_DELEGATE_MAX_DEPTH: String(options.maxDepth),
       } } : {}),
@@ -420,7 +422,11 @@ export function createRpcWorker(options: {
         return;
       }
       if (event.method === "setWidget") {
-        ui.setWidget?.(`delegate-${event.widgetKey ?? event.id}`, event.widgetLines, { placement: event.widgetPlacement });
+        if (event.widgetKey === "delegate-workers" && options.onDelegateWidget) {
+          options.onDelegateWidget(event.widgetLines);
+        } else {
+          ui.setWidget?.(`delegate-${event.widgetKey ?? event.id}`, event.widgetLines, { placement: event.widgetPlacement });
+        }
         return;
       }
       if (event.method === "setTitle") {

@@ -68,6 +68,32 @@ test("real RPC synthesis failure returns investigation fallback", { timeout: 500
   assert.equal(result.usage.totalTokens, 10);
 });
 
+test("nested worker widget updates stay under their parent and clear on completion", { timeout: 5000 }, async () => {
+  const widgets: Array<string[] | undefined> = [];
+  const ctx = {
+    cwd: process.cwd(),
+    ui: {
+      theme: { fg: (_color: string, text: string) => text },
+      setWidget: (_key: string, lines?: string[]) => { widgets.push(lines); },
+    },
+  } as any;
+  const result = await runTask(
+    ctx, new Map(),
+    { task: "parent", profile: "balanced", modelSetSource: "none" }, "w1",
+    {
+      uiDialogQueue: createRpcUiDialogQueue(),
+      reportInputStatus: () => undefined,
+      createWorker: (options) => createRpcWorker({
+        ...options,
+        spawnWorker: (_bin, args, spawnOptions) => spawn(process.execPath, [fixture, "widget", ...args], spawnOptions),
+      }),
+    },
+  );
+  assert.equal(result.ok, true);
+  assert.ok(widgets.some((lines) => lines?.some((line) => line === "w1.1 Goal: child")));
+  assert.equal(widgets.at(-1), undefined);
+});
+
 test("RPC prompt rejection reports the matching command error", { timeout: 5000 }, async () => {
   const worker = fakeWorker("error");
   try {
@@ -262,7 +288,7 @@ test("nested workers inherit coordinator identity, but depth-two workers cannot 
   };
   const parent = createRpcWorker({
     cwd: process.cwd(), tools: ["read", "delegate_tasks"], coordinatorEndpoint: "endpoint",
-    workerToken: "token-one", workerDepth: 1, maxDepth: 2, spawnWorker,
+    workerToken: "token-one", workerDepth: 1, maxDepth: 2, uiPrefix: "w5", spawnWorker,
   });
   const child = createRpcWorker({
     cwd: process.cwd(), tools: ["read"], coordinatorEndpoint: "endpoint",
@@ -274,6 +300,7 @@ test("nested workers inherit coordinator identity, but depth-two workers cannot 
     assert.equal(launches[0]!.env?.PI_DELEGATE_WORKER_DEPTH, "1");
     assert.equal(launches[1]!.env?.PI_DELEGATE_WORKER_DEPTH, "2");
     assert.equal(launches[0]!.env?.PI_DELEGATE_WORKER_TOKEN, "token-one");
+    assert.equal(launches[0]!.env?.PI_DELEGATE_PARENT_WORKER_ID, "w5");
     assert.equal(launches[1]!.env?.PI_DELEGATE_WORKER_TOKEN, "token-two");
   } finally {
     parent.dispose();

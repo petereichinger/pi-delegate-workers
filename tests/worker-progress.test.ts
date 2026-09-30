@@ -4,6 +4,8 @@ import {
   appendWorkerActivity,
   describeWorkerTool,
   formatWorkerDisplayLines,
+  formatWorkerWidgetLines,
+  normalizeWorkerId,
 } from "../extensions/index.ts";
 
 test("describes common worker RPC tool events", () => {
@@ -35,6 +37,36 @@ test("bounds streamed worker activity without changing its displayed prefix", ()
   assert.equal(first, `${"a".repeat(139)}…`);
   assert.equal(next, first);
   assert.equal(appendWorkerActivity("Reading ", "a file"), "Reading a file");
+});
+
+test("orders each parent's nested states before the next parent, including queued workers", () => {
+  const state = (id: string, nestedLines?: string[]) => ({
+    id, task: `Task ${id}`, profile: "fast" as const, status: "queued", latestMessage: "Waiting", nestedLines,
+  });
+  const lines = formatWorkerWidgetLines([
+    state("w2", ["w2.1 Goal: Child 2"]),
+    state("w10"),
+    state("w1", ["w1.1 Goal: Child 1", "w1.2 Goal: Child 1b", "w1.10 Goal: Child 1j"]),
+    state("w3"),
+  ], (_color, text) => text);
+
+  assert.deepEqual(lines.filter((line) => line.includes("Goal:")), [
+    " w1 [fast] Goal: Task w1",
+    "w1.1 Goal: Child 1",
+    "w1.2 Goal: Child 1b",
+    "w1.10 Goal: Child 1j",
+    " w2 [fast] Goal: Task w2",
+    "w2.1 Goal: Child 2",
+    " w3 [fast] Goal: Task w3",
+    " w10 [fast] Goal: Task w10",
+  ]);
+  assert.deepEqual(
+    formatWorkerWidgetLines([state("w1.10"), state("w1.2")], (_color, text) => text)
+      .filter((line) => line.includes("Goal:")),
+    [" w1.2 [fast] Goal: Task w1.2", " w1.10 [fast] Goal: Task w1.10"],
+  );
+  assert.equal(normalizeWorkerId("1.10"), "w1.10");
+  assert.equal(normalizeWorkerId("w1.2"), "w1.2");
 });
 
 test("keeps the worker goal stable while current activity changes", () => {

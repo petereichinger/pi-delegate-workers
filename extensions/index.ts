@@ -68,6 +68,7 @@ type WorkerState = {
   thinkingLevel?: DelegateProfileConfig["thinkingLevel"];
   status: string;
   latestMessage: string;
+  nestedLines?: string[];
   worker: RpcWorker;
   abortController: AbortController;
   cancelRequested: boolean;
@@ -169,7 +170,7 @@ function getCoordinatorLimits() {
 }
 
 export function normalizeWorkerId(text: string): string | undefined {
-  const match = text.trim().match(/^(?:w)?([1-9]\d*)$/i);
+  const match = text.trim().match(/^(?:w)?([1-9]\d*(?:\.[1-9]\d*)?)$/i);
   return match ? `w${match[1]}` : undefined;
 }
 
@@ -409,25 +410,35 @@ export function formatWorkerDisplayLines(
   ];
 }
 
+export function formatWorkerWidgetLines(
+  states: Array<Pick<WorkerState, "id" | "task" | "profile" | "status" | "latestMessage" | "nestedLines">>,
+  fg: (color: (typeof WORKER_STATE_STYLES)[WorkerUiState]["fg"], text: string) => string,
+): string[] {
+  return states
+    .sort((a, b) => {
+      const left = a.id.slice(1).split(".").map(Number);
+      const right = b.id.slice(1).split(".").map(Number);
+      return left[0]! - right[0]! || (left[1] ?? 0) - (right[1] ?? 0);
+    })
+    .flatMap((worker) => {
+      const uiState = getWorkerUiState(worker.status);
+      const style = WORKER_STATE_STYLES[uiState];
+      const label = fg(style.fg, `${style.icon} ${worker.id} [${worker.profile}]`);
+      return [...formatWorkerDisplayLines(label, worker.task, worker.latestMessage), ...(worker.nestedLines ?? [])];
+    });
+}
+
 function refreshUi(
   ctx: ExtensionContext,
   workers: Map<string, WorkerState>,
   queued: Map<string, QueuedWorkerState> = new Map(),
 ) {
-  if (workers.size === 0 && queued.size === 0) {
-    ctx.ui.setWidget("delegate-workers", undefined);
-    return;
-  }
-
-  const widgetLines = [...workers.values(), ...queued.values()]
-    .sort((a, b) => Number(a.id.slice(1)) - Number(b.id.slice(1)))
-    .flatMap((worker) => {
-      const uiState = getWorkerUiState(worker.status);
-      const style = WORKER_STATE_STYLES[uiState];
-      const label = ctx.ui.theme.fg(style.fg, `${style.icon} ${worker.id} [${worker.profile}]`);
-      return formatWorkerDisplayLines(label, worker.task, worker.latestMessage);
-    });
-  ctx.ui.setWidget("delegate-workers", widgetLines, { placement: "aboveEditor" });
+  const widgetLines = formatWorkerWidgetLines(
+    [...workers.values(), ...queued.values()],
+    (color, text) => ctx.ui.theme.fg(color, text),
+  );
+  if (widgetLines.length === 0) ctx.ui.setWidget("delegate-workers", undefined);
+  else ctx.ui.setWidget("delegate-workers", widgetLines, { placement: "aboveEditor" });
 }
 
 export async function runTask(
@@ -466,6 +477,14 @@ export async function runTask(
     uiPrefix: id,
     uiDialogQueue: options.uiDialogQueue,
     reportInputStatus: options.reportInputStatus,
+    onDelegateWidget: (lines) => {
+      const state = workers.get(id);
+      if (state) {
+        state.nestedLines = lines;
+        if (options.widgetRefresh) options.widgetRefresh.immediate(ctx);
+        else refreshUi(ctx, workers);
+      }
+    },
     coordinatorEndpoint: options.coordinatorEndpoint,
     workerDepth: options.workerDepth,
     workerToken: options.workerToken,
@@ -800,7 +819,8 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
   let inferredModelSetInitialized = false;
   let inferredModelSet: string | undefined;
 
-  const makeWorkerId = () => `w${nextWorkerId++}`;
+  const parentWorkerId = inheritedEndpoint ? process.env.PI_DELEGATE_PARENT_WORKER_ID : undefined;
+  const makeWorkerId = () => `${parentWorkerId ? `${parentWorkerId}.` : "w"}${nextWorkerId++}`;
   const reportInputStatus = (active: boolean, label?: string) => {
     pi.events.emit("herdr:blocked", { active, label });
   };
