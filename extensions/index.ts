@@ -118,7 +118,7 @@ type DelegatedResult = {
   usage: Usage;
 };
 
-const DEFAULT_TOOLS = ["read", "write", "edit", "bash"];
+const DEFAULT_TOOLS = ["read", "write", "edit", "bash", "codemode", "tool_search"];
 const DEFAULT_MAX_WORKERS = 5;
 const DEFAULT_MAX_ACTIVE_WORKERS = 10;
 const DEFAULT_MAX_LIVE_WORKERS = 30;
@@ -973,7 +973,7 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
       "For delegate_tasks, select profile fast for lookups, searches, summaries, and isolated checks; balanced for multi-file tracing, routine changes, and test diagnosis; deep for architecture, security, migrations, and ambiguous root causes.",
       "For delegate_tasks, leave modelSet out of each task unless the user requests a configured routing override or an independent model family. The tool selects the model set from the active parent model automatically.",
       "Depth-one workers can delegate once by default. Set PI_DELEGATE_MAX_DEPTH=1 to disable nesting; PI_DELEGATE_TOOLS can restrict worker tools.",
-      "Use a task's tools field for a read-only subset of the worker tool allowlist. The default for depth-one workers is read,write,edit,bash,delegate_tasks; depth-two workers cannot delegate.",
+      "Use a task's tools field for a read-only subset of the worker tool allowlist. The default for depth-one workers is read,write,edit,bash,codemode,tool_search,delegate_tasks; depth-two workers cannot delegate.",
     ],
     parameters: Type.Object({
       tasks: Type.Array(taskSchema, {

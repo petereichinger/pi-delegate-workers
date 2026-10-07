@@ -19,7 +19,7 @@ It launches separate `pi --mode rpc` worker processes, runs configured tasks in 
 - progress text and current tool activity streamed from each worker over RPC
 - per-worker synthesis before returning results to the parent
 - worker token and cost usage added to the parent session totals
-- normal pi worker tools plus `delegate_tasks` for depth-one workers by default; depth-two workers cannot delegate; optional per-task tool subsets
+- default worker tools include `codemode` and `tool_search`, plus `delegate_tasks` for depth-one workers; depth-two workers cannot delegate; optional per-task tool subsets
 
 The parent agent selects profiles using this rubric:
 
@@ -157,7 +157,7 @@ The profile is optional and falls back to `defaultProfile`. Leave `modelSet` out
 
 `timeoutMs` is optional per task and must be an integer from 1 to 2,147,483,647 milliseconds. It covers both the investigation and synthesis passes, starting when the worker is launched, not while it waits in the queue. Without it, the task has no deadline. An expired task stops its worker process and reports `timed out` separately from cancellation and other errors; usage recorded before expiry is still included.
 
-`tools` is an optional non-empty array of distinct tool names for one task. It must be a subset of `PI_DELEGATE_TOOLS` (or the default `read,write,edit,bash,delegate_tasks` for depth-one workers; depth-two workers cannot delegate). For example, `"tools": ["read"]` limits one worker to reading while other workers retain the configured tools. To allow search tools in a subset, first add them to `PI_DELEGATE_TOOLS`, such as `read,write,edit,bash,grep,find,ls`. Omitting `tools` preserves the current worker behavior.
+`tools` is an optional non-empty array of distinct tool names for one task. It must be a subset of `PI_DELEGATE_TOOLS` (or the default `read,write,edit,bash,codemode,tool_search,delegate_tasks` for depth-one workers; depth-two workers cannot delegate). For example, `"tools": ["read"]` limits one worker to reading while other workers retain the configured tools. `codemode` runs JavaScript scripts that call available tools; `tool_search` finds and declares deferred tools, such as MCP tools. Both are available by default at either depth. To allow file search tools (`grep`, `find`, or `ls`) in a subset, first add them to `PI_DELEGATE_TOOLS`. Omitting `tools` preserves the current worker behavior.
 
 Each worker starts with the resolved profile on its command line:
 
@@ -170,7 +170,7 @@ The same model and thinking level are used for investigation and the worker's sy
 ## Environment settings
 
 - `PI_DELEGATE_PI_BIN` — worker pi binary/path (default: `pi`)
-- `PI_DELEGATE_TOOLS` — comma-separated worker tool allowlist (default: `read,write,edit,bash,delegate_tasks` at depth one; `read,write,edit,bash` at depth two)
+- `PI_DELEGATE_TOOLS` — comma-separated worker tool allowlist (default: `read,write,edit,bash,codemode,tool_search,delegate_tasks` at depth one; `read,write,edit,bash,codemode,tool_search` at depth two). An explicit value replaces these defaults.
 - `PI_DELEGATE_MAX_WORKERS` — maximum tasks per batch (default: `5`)
 - `PI_DELEGATE_MAX_ACTIVE_WORKERS` — maximum concurrently working delegated workers in one parent session (default: `10`)
 - `PI_DELEGATE_MAX_LIVE_WORKERS` — maximum live worker processes in one parent session (default: `30`; must be at least the active limit, and at least `2` for nesting)
@@ -193,5 +193,5 @@ When a resolved profile controls the model or thinking level, conflicting `--pro
 - The parent extension captures at most the first 32,768 characters of investigation assistant text and 16,384 characters of synthesis assistant text. Clipped fallback or synthesis reports are marked. This does not limit the worker's conversation context or tool results.
 - The live parent widget keeps each worker's assigned goal and ID visible on a stable line while RPC events update a separate current-activity line. Streamed text updates are throttled to at most one widget refresh per second; state changes refresh immediately. Use `/cancel-worker <id>` to stop one worker without stopping the others.
 - Worker extension UI requests are proxied to the parent UI and parallel dialogs are queued. Disposing a worker dismisses its open dialog and skips its queued dialogs. While a proxied dialog is open, the parent emits `herdr:blocked` so the authoritative TUI integration reports that it is waiting for input.
-- Tool-guard is reused from a parent extension argument or an adjacent `pi-tool-guard` checkout when available. Worker extension discovery stays enabled by default so extension-provided models remain available; set `PI_DELEGATE_TOOL_GUARD_ISOLATE=1` only when duplicate guard discovery is a problem.
+- Tool-guard is reused from a parent extension argument or an adjacent `pi-tool-guard` checkout when available. Worker extension discovery stays enabled by default so extension-provided models remain available; set `PI_DELEGATE_TOOL_GUARD_ISOLATE=1` only when duplicate guard discovery is a problem. Isolation or `--no-extensions` also disables the built-in `codemode` and `tool_search` extensions. To retain them, add `-e builtin:codemode -e builtin:tool-search` to `PI_DELEGATE_EXTRA_ARGS`.
 - Read-only tasks can select `"tools": ["read"]`. To allow `grep`, `find`, or `ls`, include them in `PI_DELEGATE_TOOLS` first. To make every worker read-only, set `PI_DELEGATE_TOOLS=read,grep,find,ls`.
