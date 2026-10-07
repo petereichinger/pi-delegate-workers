@@ -53,10 +53,10 @@ for (const workerDepth of [1, 2]) {
       const tool = registeredTool();
       assert.equal(
         tool.parameters.properties.tasks.items.properties.tools.description,
-        `Optional per-task tool subset of PI_DELEGATE_TOOLS (current default: ${expected.join(",")}).`,
+        `Optional per-task tool subset of PI_DELEGATE_TOOLS (current default: ${expected.join(",")}). For read-only tasks, include read, codemode, and tool_search when allowed; add bash only when command access is needed.`,
       );
       const context = { model: undefined } as any;
-      for (const tools of [expected, ...expected.map((name) => [name])]) {
+      for (const tools of [expected, ["read", "codemode", "tool_search"], ...expected.map((name) => [name])]) {
         const tasks = [{ task: "inspect", tools }];
         assert.equal(Check(tool.parameters, { tasks }), true);
         assert.deepEqual(routeTasks(context, tasks, config)[0]?.tools, tools);
@@ -75,7 +75,7 @@ for (const workerDepth of [1, 2]) {
       const tool = registeredTool();
       assert.equal(
         tool.parameters.properties.tasks.items.properties.tools.description,
-        "Optional per-task tool subset of PI_DELEGATE_TOOLS (current default: read,bash).",
+        "Optional per-task tool subset of PI_DELEGATE_TOOLS (current default: read,bash). For read-only tasks, include read, codemode, and tool_search when allowed; add bash only when command access is needed.",
       );
       const context = { model: undefined } as any;
       assert.deepEqual(
@@ -91,6 +91,16 @@ for (const workerDepth of [1, 2]) {
     });
   });
 }
+
+test("read-only guidance keeps codemode and tool_search without claiming tool subsets are a sandbox", () => {
+  withWorkerEnvironment(0, undefined, () => {
+    const guidelines = registeredTool().promptGuidelines.join("\n");
+    assert.match(guidelines, /For read-only tasks, include read, codemode, and tool_search when allowed by the worker allowlist/);
+    assert.match(guidelines, /Explicit PI_DELEGATE_TOOLS restrictions remain authoritative/);
+    assert.match(guidelines, /must not make changes through scripts, shell commands, or discovered tools/);
+    assert.match(guidelines, /Tool selection is not a read-only sandbox; bash permits writes/);
+  });
+});
 
 test("nesting is enabled at depth one by default, disabled at depth two or with max depth one", () => {
   const names = ["PI_DELEGATE_COORDINATOR_ENDPOINT", "PI_DELEGATE_WORKER_TOKEN", "PI_DELEGATE_WORKER_DEPTH", "PI_DELEGATE_MAX_DEPTH"] as const;

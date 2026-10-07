@@ -139,7 +139,7 @@ The current tool schema uses structured tasks:
 ```json
 {
   "tasks": [
-    { "task": "Locate the auth middleware", "profile": "fast", "tools": ["read"] },
+    { "task": "Locate the auth middleware without making changes", "profile": "fast", "tools": ["read", "codemode", "tool_search"] },
     { "task": "Trace token refresh failures", "profile": "balanced" },
     { "task": "Review migration safety", "profile": "deep" },
     {
@@ -157,7 +157,7 @@ The profile is optional and falls back to `defaultProfile`. Leave `modelSet` out
 
 `timeoutMs` is optional per task and must be an integer from 1 to 2,147,483,647 milliseconds. It covers both the investigation and synthesis passes, starting when the worker is launched, not while it waits in the queue. Without it, the task has no deadline. An expired task stops its worker process and reports `timed out` separately from cancellation and other errors; usage recorded before expiry is still included.
 
-`tools` is an optional non-empty array of distinct tool names for one task. It must be a subset of `PI_DELEGATE_TOOLS` (or the default `read,write,edit,bash,codemode,tool_search,delegate_tasks` for depth-one workers; depth-two workers cannot delegate). For example, `"tools": ["read"]` limits one worker to reading while other workers retain the configured tools. `codemode` runs JavaScript scripts that call available tools; `tool_search` finds and declares deferred tools, such as MCP tools. Both are available by default at either depth. To allow file search tools (`grep`, `find`, or `ls`) in a subset, first add them to `PI_DELEGATE_TOOLS`. Omitting `tools` preserves the current worker behavior.
+`tools` is an optional non-empty array of distinct tool names for one task. It must be a subset of `PI_DELEGATE_TOOLS` (or the default `read,write,edit,bash,codemode,tool_search,delegate_tasks` for depth-one workers; depth-two workers cannot delegate). For read-only tasks, use `"tools": ["read", "codemode", "tool_search"]` when all three tools are in the worker allowlist. Do not exclude `codemode` or `tool_search` just because the task is read-only. Add `bash` only when command access is needed. Explicit tool restrictions remain authoritative; no tools are added automatically. `codemode` runs JavaScript scripts that call available tools; `tool_search` finds and declares deferred tools, such as MCP tools. Both are available by default at either depth. To allow file search tools (`grep`, `find`, or `ls`) in a subset, first add them to `PI_DELEGATE_TOOLS`. Omitting `tools` preserves the current worker behavior.
 
 Each worker starts with the resolved profile on its command line:
 
@@ -194,4 +194,4 @@ When a resolved profile controls the model or thinking level, conflicting `--pro
 - The live parent widget keeps each worker's assigned goal and ID visible on a stable line while RPC events update a separate current-activity line. Streamed text updates are throttled to at most one widget refresh per second; state changes refresh immediately. Use `/cancel-worker <id>` to stop one worker without stopping the others.
 - Worker extension UI requests are proxied to the parent UI and parallel dialogs are queued. Disposing a worker dismisses its open dialog and skips its queued dialogs. While a proxied dialog is open, the parent emits `herdr:blocked` so the authoritative TUI integration reports that it is waiting for input.
 - Tool-guard is reused from a parent extension argument or an adjacent `pi-tool-guard` checkout when available. Worker extension discovery stays enabled by default so extension-provided models remain available; set `PI_DELEGATE_TOOL_GUARD_ISOLATE=1` only when duplicate guard discovery is a problem. Isolation or `--no-extensions` also disables the built-in `codemode` and `tool_search` extensions. To retain them, add `-e builtin:codemode -e builtin:tool-search` to `PI_DELEGATE_EXTRA_ARGS`.
-- Read-only tasks can select `"tools": ["read"]`. To allow `grep`, `find`, or `ls`, include them in `PI_DELEGATE_TOOLS` first. To make every worker read-only, set `PI_DELEGATE_TOOLS=read,grep,find,ls`.
+- For read-only tasks, select `"tools": ["read", "codemode", "tool_search"]` when allowed and instruct the worker not to make changes through scripts, shell commands, or discovered tools. Tool selection is not a read-only sandbox; `bash` permits writes. To allow `grep`, `find`, or `ls`, include them in `PI_DELEGATE_TOOLS` first. A reading and search configuration can use `PI_DELEGATE_TOOLS=read,grep,find,ls,codemode,tool_search`; enforce strict read-only access with permissions or a sandbox.

@@ -956,7 +956,7 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
       Type.Array(Type.String({ minLength: 1 }), {
         minItems: 1,
         uniqueItems: true,
-        description: `Optional per-task tool subset of PI_DELEGATE_TOOLS (current default: ${getWorkerTools().join(",")}).`,
+        description: `Optional per-task tool subset of PI_DELEGATE_TOOLS (current default: ${getWorkerTools().join(",")}). For read-only tasks, include read, codemode, and tool_search when allowed; add bash only when command access is needed.`,
       }),
     ),
   });
@@ -973,7 +973,8 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
       "For delegate_tasks, select profile fast for lookups, searches, summaries, and isolated checks; balanced for multi-file tracing, routine changes, and test diagnosis; deep for architecture, security, migrations, and ambiguous root causes.",
       "For delegate_tasks, leave modelSet out of each task unless the user requests a configured routing override or an independent model family. The tool selects the model set from the active parent model automatically.",
       "Depth-one workers can delegate once by default. Set PI_DELEGATE_MAX_DEPTH=1 to disable nesting; PI_DELEGATE_TOOLS can restrict worker tools.",
-      "Use a task's tools field for a read-only subset of the worker tool allowlist. The default for depth-one workers is read,write,edit,bash,codemode,tool_search,delegate_tasks; depth-two workers cannot delegate.",
+      "Use a task's tools field to restrict worker tools. For read-only tasks, include read, codemode, and tool_search when allowed by the worker allowlist; do not exclude codemode or tool_search just because the task is read-only. Add bash only when command access is needed. Explicit PI_DELEGATE_TOOLS restrictions remain authoritative.",
+      "Read-only tasks must not make changes through scripts, shell commands, or discovered tools. Tool selection is not a read-only sandbox; bash permits writes. The default for depth-one workers is read,write,edit,bash,codemode,tool_search,delegate_tasks; depth-two workers cannot delegate.",
     ],
     parameters: Type.Object({
       tasks: Type.Array(taskSchema, {
