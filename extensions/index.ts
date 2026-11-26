@@ -332,7 +332,7 @@ function resultStatus(result: JobResult): string {
 
 const RESULT_SEPARATOR = "\n\n---\n\n";
 const RESULT_OUTPUT_PREVIEW_ROWS = 3;
-type ResultOutputRange = { start: number; end: number };
+type ResultOutputRange = { start: number; end: number; commandSummary?: string };
 type ResultRenderDetails = { outputRanges?: ResultOutputRange[] };
 
 function formatResults(results: JobResult[]): { text: string; outputRanges: ResultOutputRange[] } {
@@ -360,27 +360,40 @@ function formatResults(results: JobResult[]): { text: string; outputRanges: Resu
     ].join("\n") + "\n\n";
     const start = text.length;
     text += result.output.trim() || "(no output)";
-    outputRanges.push({ start, end: text.length });
+    const commandSummary = "shell" in result
+      ? `${result.id} [${result.shell}] ${resultStatus(result)} (exit ${result.exitCode ?? "unavailable"}, ${result.durationMs} ms)`
+      : undefined;
+    outputRanges.push({ start, end: text.length, commandSummary });
   }
   return { text, outputRanges };
 }
 
 function renderResults(text: string, outputRanges: ResultOutputRange[] | undefined, expanded: boolean, theme: Theme) {
-  const displayText = (value: string) => new Text(
-    theme.fg("toolOutput", stripVTControlCharacters(value).replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "")), 0, 0,
-  );
+  const sanitize = (value: string) => stripVTControlCharacters(value).replace(/\r\n?/g, "\n")
+    .replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "");
+  const displayText = (value: string) => new Text(theme.fg("toolOutput", sanitize(value)), 0, 0);
   if (expanded || outputRanges?.at(-1)?.end !== text.length) return displayText(text);
 
   const shortcut = keyText("app.tools.expand");
   const hint = new TruncatedText(theme.fg("muted", shortcut ? `… ${shortcut} to expand` : "… more output"));
   const results = new Container();
   let offset = 0;
-  for (const { start, end } of outputRanges) {
+  let previousWasCommand = false;
+  for (const { start, end, commandSummary } of outputRanges) {
     if (offset > 0) {
-      results.addChild(new Spacer(1));
-      results.addChild(displayText(RESULT_SEPARATOR.trim()));
-      results.addChild(new Spacer(1));
+      if (!previousWasCommand || commandSummary === undefined) {
+        results.addChild(new Spacer(1));
+        results.addChild(displayText(RESULT_SEPARATOR.trim()));
+        results.addChild(new Spacer(1));
+      }
       offset += RESULT_SEPARATOR.length;
+    }
+    previousWasCommand = commandSummary !== undefined;
+    if (commandSummary !== undefined) {
+      const preview = sanitize(text.slice(start, end)).replace(/\s+/g, " ").trim();
+      results.addChild(new TruncatedText(theme.fg("toolOutput", `${commandSummary}: ${preview}`)));
+      offset = end;
+      continue;
     }
     results.addChild(displayText(text.slice(offset, start - 2)));
     results.addChild(new Spacer(1));

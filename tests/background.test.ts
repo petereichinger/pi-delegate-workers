@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
+import { stripVTControlCharacters } from "node:util";
 import {
   createEventBus,
   type AgentToolResult,
@@ -131,32 +132,24 @@ test("blocking commands wait for their own output and use configured Bash setup"
 
 const multiLineCommand = "printf 'row-one\\nrow-two\\nrow-three\\nrow-four\\n'";
 
-function assertOutputPreview(lines: string[]) {
-  for (const row of ["row-one", "row-two", "row-three"]) assert.ok(lines.includes(row));
-  assert.ok(!lines.includes("row-four"));
-  assert.equal(lines.filter((line) => line.startsWith("…")).length >= 1, true);
-}
-
-test("blocking results keep metadata and limit each job to three visual rows until expanded", async (t) => {
+test("blocking command results use one visual line per job until expanded", async (t) => {
   const r = runtime(t, null);
   const result = await r.execute({ commands: [
     { command: multiLineCommand },
     { command: "printf '%0200d%s%s\\n' 0 'wrapped-' 'tail'" },
-    { command: "printf 'short-output\\n'" },
+    { command: "exit 7" },
   ] });
   const collapsed = r.renderToolResult(result, false);
-  assertOutputPreview(collapsed);
-  assert.equal(collapsed.filter((line) => line === "exit_code: 0").length, 3);
-  assert.equal(collapsed.filter((line) => line.startsWith("duration_ms: ")).length, 3);
-  assert.equal(collapsed.filter((line) => /^0+$/.test(line)).length, 3);
-  assert.equal(collapsed.filter((line) => line.startsWith("…")).length, 2);
-  assert.ok(collapsed.includes("short-output"));
+  assert.equal(collapsed.length, 3);
+  assert.match(collapsed[0]!, /^w1 \[bash\] ok \(exit 0, \d+ ms\): row-one row-two /);
+  assert.match(stripVTControlCharacters(collapsed[1]!), /^w2 \[bash\] ok \(exit 0, \d+ ms\): 0+\.{3}$/);
+  assert.match(collapsed[2]!, /^w3 \[bash\] error \(exit 7, \d+ ms\): \(no output\)$/);
   assert.match(result.content[0].text, /\nrow-four\n/);
   assert.match(result.content[0].text, /0wrapped-tail/);
   const expanded = r.renderToolResult(result, true);
   assert.ok(expanded.includes("row-four"));
   assert.ok(expanded.some((line) => /0wrapped-tail$/.test(line)));
-  assert.ok(!expanded.some((line) => line.startsWith("…")));
+  assert.ok(expanded.includes("exit_code: 7"));
 });
 
 test("background results keep full context and show only a preview in the transcript", async (t) => {
@@ -166,17 +159,20 @@ test("background results keep full context and show only a preview in the transc
   const message = r.messages[0]!;
   assert.match(message.content, /\nrow-four$/);
   assert.deepEqual(r.notifications, ["Delegate job w1: ok"]);
-  const collapsed = r.renderMessage(message, false);
-  assert.ok(collapsed.includes("status: ok"));
-  assertOutputPreview(collapsed);
+  const collapsed = r.renderMessage(message, false).filter(Boolean);
+  assert.equal(collapsed.length, 1);
+  assert.match(collapsed[0]!, /^w1 \[bash\] ok \(exit 0, \d+ ms\): row-one row-two /);
   assert.ok(r.renderMessage(message, true).includes("row-four"));
 });
 
 test("PowerShell executes directly and preserves non-zero exit status", { skip: process.platform !== "win32" }, async (t) => {
   const r = runtime(t, null);
-  const result = await r.execute({ commands: [{ command: "Write-Output 'ps-out'; exit 11", shell: "powershell" }] });
+  const result = await r.execute({ commands: [{ command: "Write-Output 'ps-out', 'ps-next'; exit 11", shell: "powershell" }] });
   assert.match(result.content[0].text, /exit_code: 11/);
-  assert.match(result.content[0].text, /ps-out/);
+  assert.match(result.content[0].text, /ps-out\r?\nps-next/);
+  const collapsed = r.renderToolResult(result, false);
+  assert.equal(collapsed.length, 1);
+  assert.match(collapsed[0]!, /^w1 \[powershell\] error \(exit 11, \d+ ms\): ps-out ps-next$/);
 });
 
 test("command output is bounded and strips control characters", async (t) => {
