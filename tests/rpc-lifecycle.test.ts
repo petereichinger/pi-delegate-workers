@@ -94,6 +94,38 @@ test("nested worker widget updates stay under their parent and clear on completi
   assert.equal(widgets.at(-1), undefined);
 });
 
+test("background agents decline RPC approval requests without touching the parent UI", { timeout: 5000 }, async () => {
+  let confirmations = 0;
+  const ctx = {
+    cwd: process.cwd(),
+    ui: {
+      theme: { fg: (_color: string, text: string) => text },
+      setWidget: () => undefined,
+      confirm: async () => { confirmations++; return true; },
+    },
+  } as any;
+  const result = await runTask(
+    ctx, new Map(),
+    { task: "requires approval", profile: "balanced", modelSetSource: "none" }, "w1",
+    {
+      background: true,
+      uiDialogQueue: createRpcUiDialogQueue(),
+      reportInputStatus: () => assert.fail("Unexpected parent dialog"),
+      createWorker: (options) => {
+        assert.equal(options.maxDepth, 1);
+        assert.equal(options.tools.includes("delegate_tasks"), false);
+        assert.equal(options.enforceTools, true);
+        return createRpcWorker({
+          ...options,
+          spawnWorker: (_bin, args, spawnOptions) => spawn(process.execPath, [fixture, "dialog", ...args], spawnOptions),
+        });
+      },
+    },
+  );
+  assert.equal(result.output, "declined");
+  assert.equal(confirmations, 0);
+});
+
 test("RPC prompt rejection reports the matching command error", { timeout: 5000 }, async () => {
   const worker = fakeWorker("error");
   try {

@@ -2,14 +2,16 @@
 
 A local pi package that adds a `delegate_tasks` tool for model-directed delegation.
 
-It launches separate `pi --mode rpc` worker processes, runs configured tasks in parallel, asks each worker to synthesize its own findings, and returns compact summaries to the main session.
+The agent decides what to delegate from normal prompts. Work that needs reasoning runs in `pi --mode rpc` workers and returns compact summaries. Shell commands run directly in the current working directory without starting Pi or using a model. Both kinds of work can run in parallel, either blocking or in the background.
 
 ## What it does
 
 - `delegate_tasks` with parent-agent-selected `fast`, `balanced`, or `deep` profiles
-- `/cancel-worker 13` to cancel the running worker shown as `w13` in the live widget (the `w13` form is also accepted)
-- optional per-task deadlines covering investigation and synthesis after a worker starts; tasks have no timeout by default
-- session-wide coordinator queues tasks across overlapping calls and limits concurrently active workers
+- background jobs return IDs immediately after authorization and report results separately as they finish
+- direct Bash and PowerShell commands authorized by `pi-tool-guard`
+- `/cancel-worker 13` to cancel the queued or running job shown as `w13` in the live widget (the `w13` form is also accepted)
+- optional deadlines starting when a job launches; jobs have no timeout by default
+- session-wide coordinator queues jobs across overlapping calls and limits concurrent execution
 - one-level nested delegation by default, with a shared coordinator and descendant cancellation
 - per-profile model and thinking level configuration
 - automatic model-set selection from the active parent model
@@ -132,9 +134,30 @@ Set a profile property to `null` to clear an inherited value and use pi's startu
 
 Named model sets are deeply merged across scopes. Set a model-set entry to `null` to remove it, or set `defaultModelSet` to `null` to clear the inherited default. `parentModelRoutes` is ordered, so a narrower scope replaces the complete inherited route list; set it to `null` to clear all inherited routes.
 
+## What to prompt
+
+Use a normal prompt, for example: “Run `yarn testBlabla` in the background while you review the config change.” There is no launch command. Use the live widget to see which jobs are queued or running and `/cancel-worker <id>` to stop one.
+
+Direct commands require [`pi-tool-guard`](https://github.com/petereichinger/pi-tool-guard) v0.15.0 or later. For local testing, load both checkouts with `pi -e /path/to/pi-delegate-workers -e /path/to/pi-tool-guard`. If the guard is missing or does not respond, command delegation is disabled; agent delegation still works.
+
 ## Tool usage
 
-The current tool schema uses structured tasks:
+The agent calls `delegate_tasks` with structured agent tasks, direct commands, or both. It waits for results unless it selects `"mode": "background"`. For example:
+
+```json
+{
+  "mode": "background",
+  "commands": [{ "command": "yarn testBlabla", "shell": "bash", "timeoutMs": 300000 }],
+  "tasks": [{ "task": "Review the config change without editing files", "profile": "fast" }]
+}
+```
+
+- Commands default to Bash. Use `"shell": "powershell"` on Windows if that tool is available. The tool guard checks each command before the batch is queued. A required approval can pause submission, but not the background run.
+- Commands use the local shell backend, with bounded combined stdout/stderr and an exit code. Agent jobs and command jobs share the same concurrency limits. A command job does not use a worker profile or `sharedContext`.
+- Background jobs survive cancellation of the parent turn. Switching sessions, reloading, or exiting cancels them. Each job posts a status and short preview immediately; the full result enters the originating session when Pi can append it without interrupting an active turn. Completion does not start a new model turn. Background agent usage is recorded with its result, not added to Pi’s built-in usage totals.
+- Background agents cannot open parent dialogs or delegate further. Nested calls support blocking agent tasks only.
+
+A blocking agent-only batch can use the existing form:
 
 ```json
 {
@@ -165,15 +188,15 @@ Each worker starts with the resolved profile on its command line:
 pi --mode rpc --no-session --model provider/model --thinking medium --tools ...
 ```
 
-The same model and thinking level are used for investigation and the worker's synthesis pass. Usage from both passes, nested worker tools, and worker compaction is aggregated into the `delegate_tasks` tool result. Pi includes it in the parent session footer, `/session`, and RPC session totals.
+The same model and thinking level are used for investigation and the worker's synthesis pass. For blocking calls, usage from both passes, nested worker tools, and worker compaction is aggregated into the `delegate_tasks` tool result. Pi includes it in the parent session footer, `/session`, and RPC session totals.
 
 ## Environment settings
 
 - `PI_DELEGATE_PI_BIN` — worker pi binary/path (default: `pi`)
 - `PI_DELEGATE_TOOLS` — comma-separated worker tool allowlist (default: `read,write,edit,bash,codemode,tool_search,delegate_tasks` at depth one; `read,write,edit,bash,codemode,tool_search` at depth two). An explicit value replaces these defaults.
-- `PI_DELEGATE_MAX_WORKERS` — maximum tasks per batch (default: `5`)
-- `PI_DELEGATE_MAX_ACTIVE_WORKERS` — maximum concurrently working delegated workers in one parent session (default: `10`)
-- `PI_DELEGATE_MAX_LIVE_WORKERS` — maximum live worker processes in one parent session (default: `30`; must be at least the active limit, and at least `2` for nesting)
+- `PI_DELEGATE_MAX_WORKERS` — maximum total agent tasks and command jobs per batch (default: `5`)
+- `PI_DELEGATE_MAX_ACTIVE_WORKERS` — maximum concurrently running jobs in one parent session (default: `10`)
+- `PI_DELEGATE_MAX_LIVE_WORKERS` — maximum live delegated jobs in one parent session, including workers that yield their active slot (default: `30`; must be at least the active limit, and at least `2` for nesting)
 - `PI_DELEGATE_MAX_DEPTH` — maximum delegation depth: `2` (default; allow one nested level) or `1` (disable nesting)
 - `PI_DELEGATE_EXTRA_ARGS` — additional worker CLI arguments
 - `PI_DELEGATE_TOOL_GUARD` — tool-guard auto-loading mode; set `0`/`false` to disable or `1`/`required` to force
