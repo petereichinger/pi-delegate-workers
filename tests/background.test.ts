@@ -4,7 +4,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
-import { createEventBus, type ExtensionAPI, type ExtensionToolContext } from "@earendil-works/pi-coding-agent";
+import {
+  createEventBus,
+  type AgentToolResult,
+  type ExtensionAPI,
+  type ExtensionToolContext,
+  type MessageRenderer,
+  type Theme,
+  type ToolRenderResultOptions,
+} from "@earendil-works/pi-coding-agent";
+import type { Component } from "@earendil-works/pi-tui";
 import delegateWorkersExtension from "../extensions/index.ts";
 
 function runtime(t: TestContext, deny?: string | null, settings = {}) {
@@ -24,19 +33,28 @@ function runtime(t: TestContext, deny?: string | null, settings = {}) {
   });
   const handlers = new Map<string, () => Promise<void>>();
   const commands = new Map<string, { handler: (args: string, ctx: ExtensionToolContext) => Promise<void> }>();
-  const messages: Array<{ content: string; details: { id: string; status: string }; options: { triggerTurn: boolean } }> = [];
+  const messages: Array<{
+    customType: string; display: boolean; content: string;
+    details: { id: string; status: string }; options: { triggerTurn: boolean };
+  }> = [];
+  const renderers = new Map<string, MessageRenderer>();
+  const theme = { fg: (_color: string, text: string) => text, bg: (_color: string, text: string) => text } as Theme;
   const notifications: string[] = [];
   const ctx = {
     cwd, hasUI: true, tools: [{ name: "bash" }, ...(process.platform === "win32" ? [{ name: "powershell" }] : [])],
-    ui: { theme: { fg: (_color: string, text: string) => text }, setWidget: () => {}, notify: (message: string) => notifications.push(message) },
+    ui: { theme, setWidget: () => {}, notify: (message: string) => notifications.push(message) },
   } as unknown as ExtensionToolContext;
-  let tool: { execute: (id: string, params: unknown, signal: AbortSignal | undefined, update: undefined, ctx: ExtensionToolContext) => Promise<any> };
+  let tool: {
+    execute(id: string, params: unknown, signal: AbortSignal | undefined, update: undefined, ctx: ExtensionToolContext): Promise<any>;
+    renderResult(result: AgentToolResult<unknown>, options: ToolRenderResultOptions, theme: Theme): Component;
+  };
   delegateWorkersExtension({
     events,
     getSettings: () => settings,
     on: (name: string, handler: () => Promise<void>) => handlers.set(name, handler),
     registerCommand: (name: string, command: never) => commands.set(name, command),
     registerTool: (definition: typeof tool) => { tool = definition; },
+    registerMessageRenderer: (name: string, renderer: MessageRenderer) => renderers.set(name, renderer),
     sendMessage: (message: Omit<(typeof messages)[number], "options">, options: { triggerTurn: boolean }) => messages.push({ ...message, options }),
   } as unknown as ExtensionAPI);
   const stop = () => handlers.get("session_shutdown")!();
@@ -52,6 +70,11 @@ function runtime(t: TestContext, deny?: string | null, settings = {}) {
   return {
     cwd, messages, notifications, authorizations, stop,
     execute: (params: unknown, signal?: AbortSignal) => tool.execute("test-call", params, signal, undefined, ctx),
+    renderToolResult: (result: AgentToolResult<unknown>, expanded: boolean) =>
+      tool.renderResult(result, { expanded, isPartial: false }, theme).render(60).map((line) => line.trim()),
+    renderMessage: (message: (typeof messages)[number], expanded: boolean) =>
+      renderers.get(message.customType)!({ ...message, role: "custom", timestamp: 0 }, { expanded, outputPad: 1 }, theme)!
+        .render(60).map((line) => line.trim()),
     cancel: (id: string) => commands.get("cancel-worker")!.handler(id, ctx),
   };
 }
@@ -104,6 +127,49 @@ test("blocking commands wait for their own output and use configured Bash setup"
   assert.match(result.content[0].text, /exit_code: 0/);
   assert.match(result.content[0].text, /prefix-value/);
   assert.deepEqual(r.messages, []);
+});
+
+const multiLineCommand = "printf 'row-one\\nrow-two\\nrow-three\\nrow-four\\n'";
+
+function assertOutputPreview(lines: string[]) {
+  for (const row of ["row-one", "row-two", "row-three"]) assert.ok(lines.includes(row));
+  assert.ok(!lines.includes("row-four"));
+  assert.equal(lines.filter((line) => line.startsWith("…")).length >= 1, true);
+}
+
+test("blocking results keep metadata and limit each job to three visual rows until expanded", async (t) => {
+  const r = runtime(t, null);
+  const result = await r.execute({ commands: [
+    { command: multiLineCommand },
+    { command: "printf '%0200d%s%s\\n' 0 'wrapped-' 'tail'" },
+    { command: "printf 'short-output\\n'" },
+  ] });
+  const collapsed = r.renderToolResult(result, false);
+  assertOutputPreview(collapsed);
+  assert.equal(collapsed.filter((line) => line === "exit_code: 0").length, 3);
+  assert.equal(collapsed.filter((line) => line.startsWith("duration_ms: ")).length, 3);
+  assert.equal(collapsed.filter((line) => /^0+$/.test(line)).length, 3);
+  assert.equal(collapsed.filter((line) => line.startsWith("…")).length, 2);
+  assert.ok(collapsed.includes("short-output"));
+  assert.match(result.content[0].text, /\nrow-four\n/);
+  assert.match(result.content[0].text, /0wrapped-tail/);
+  const expanded = r.renderToolResult(result, true);
+  assert.ok(expanded.includes("row-four"));
+  assert.ok(expanded.some((line) => /0wrapped-tail$/.test(line)));
+  assert.ok(!expanded.some((line) => line.startsWith("…")));
+});
+
+test("background results keep full context and show only a preview in the transcript", async (t) => {
+  const r = runtime(t, null);
+  await r.execute({ mode: "background", commands: [{ command: multiLineCommand }] });
+  await until(() => r.messages.length === 1);
+  const message = r.messages[0]!;
+  assert.match(message.content, /\nrow-four$/);
+  assert.deepEqual(r.notifications, ["Delegate job w1: ok"]);
+  const collapsed = r.renderMessage(message, false);
+  assert.ok(collapsed.includes("status: ok"));
+  assertOutputPreview(collapsed);
+  assert.ok(r.renderMessage(message, true).includes("row-four"));
 });
 
 test("PowerShell executes directly and preserves non-zero exit status", { skip: process.platform !== "win32" }, async (t) => {

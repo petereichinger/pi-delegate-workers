@@ -154,8 +154,9 @@ The agent calls `delegate_tasks` with structured agent tasks, direct commands, o
 
 - Commands default to Bash. Use `"shell": "powershell"` on Windows if that tool is available. The tool guard checks each command before the batch is queued. A required approval can pause submission, but not the background run.
 - Commands use the local shell backend, with bounded combined stdout/stderr and an exit code. Agent jobs and command jobs share the same concurrency limits. A command job does not use a worker profile or `sharedContext`.
-- Background jobs survive cancellation of the parent turn. Switching sessions, reloading, or exiting cancels them. Each job posts a status and short preview immediately; the full result enters the originating session when Pi can append it without interrupting an active turn. Completion does not start a new model turn. Background agent usage is recorded with its result, not added to Pi’s built-in usage totals.
+- Background jobs survive cancellation of the parent turn. Switching sessions, reloading, or exiting cancels them. Each job posts a status notification immediately. Its result enters the originating session when Pi can append it without interrupting an active turn. Completion does not start a new model turn. Background agent usage is recorded with its result, not added to Pi’s built-in usage totals.
 - Background agents cannot open parent dialogs or delegate further. Nested calls support blocking agent tasks only.
+- In Pi’s terminal UI, finished jobs show their status and statistics plus up to three rows of output per job. Use Pi’s tool output shortcut (`Ctrl+O` by default) to expand or collapse the output. The model still receives the full result, subject to the existing output limits.
 
 A blocking agent-only batch can use the existing form:
 

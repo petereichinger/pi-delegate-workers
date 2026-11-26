@@ -40,6 +40,7 @@ function registeredTool() {
   delegateWorkersExtension({
     on: () => undefined,
     registerCommand: () => undefined,
+    registerMessageRenderer: () => undefined,
     registerTool: (registered: unknown) => { tool = registered; },
   } as any);
   return tool;
@@ -113,6 +114,7 @@ test("nesting is enabled at depth one by default, disabled at depth two or with 
     const pi = {
       on: () => undefined,
       registerCommand: () => undefined,
+      registerMessageRenderer: () => undefined,
       registerTool: (tool: { name: string }) => { tools.push(tool.name); },
     } as any;
     process.env.PI_DELEGATE_WORKER_DEPTH = "1";
@@ -135,12 +137,7 @@ test("nesting is enabled at depth one by default, disabled at depth two or with 
 });
 
 test("delegate_tasks accepts structured tasks without a legacy string adapter", () => {
-  let tool: any;
-  delegateWorkersExtension({
-    on: () => undefined,
-    registerCommand: () => undefined,
-    registerTool: (registered: unknown) => { tool = registered; },
-  } as any);
+  const tool = registeredTool();
 
   assert.equal(tool.prepareArguments, undefined);
   assert.equal(Check(tool.parameters, { tasks: [{ task: "inspect" }] }), true);

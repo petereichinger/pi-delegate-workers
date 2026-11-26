@@ -34,6 +34,7 @@ test("nested tool waits for sibling work, delegates through the shared coordinat
     delegateWorkersExtension({
       on: (name: string, handler: (event: any) => void) => { handlers.set(name, handler); },
       registerCommand: () => undefined,
+      registerMessageRenderer: () => undefined,
       registerTool: (registered: any) => { tool = registered; },
       events: { emit: () => undefined },
     } as any);

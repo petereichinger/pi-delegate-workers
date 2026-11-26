@@ -4,10 +4,15 @@ import {
   type Usage,
 } from "@earendil-works/pi-ai";
 import { minimatch } from "minimatch";
-import type {
-  ExtensionAPI,
-  ExtensionContext,
+import {
+  keyText,
+  type AgentToolResult,
+  type ExtensionAPI,
+  type ExtensionContext,
+  type Theme,
 } from "@earendil-works/pi-coding-agent";
+import { Box, Container, Spacer, Text, TruncatedText } from "@earendil-works/pi-tui";
+import { stripVTControlCharacters } from "node:util";
 import { Type } from "typebox";
 import {
   acquireWorkerSlot,
@@ -325,33 +330,72 @@ function resultStatus(result: JobResult): string {
   return result.timedOut ? "timed out" : result.cancelled ? "cancelled" : result.ok ? "ok" : "error";
 }
 
-function formatResults(results: JobResult[]): string {
-  return results
-    .map((result) => {
-      const header = `## ${result.id} — ${result.task}`;
-      const body = result.output.trim() || "(no output)";
-      return [
-        header,
-        "",
-        `status: ${resultStatus(result)}`,
-        ...("shell" in result
-          ? [`shell: ${result.shell}`, `exit_code: ${result.exitCode ?? "unavailable"}`]
-          : [
-              `profile: ${result.profile}`,
-              `model_set: ${result.modelSet ?? "baseline"}`,
-              `model_set_source: ${result.modelSetSource}`,
-              `model: ${configuredValue(result.model)}`,
-              `thinking: ${configuredValue(result.thinkingLevel)}`,
-              ...(result.tools === undefined ? [] : [`tools: ${result.tools.join(",")}`]),
-            ]),
-        `duration_ms: ${result.durationMs}`,
-        ...(result.queueWaitMs === undefined ? [] : [`queue_wait_ms: ${result.queueWaitMs}`]),
-        ...(result.timeoutMs === undefined ? [] : [`timeout_ms: ${result.timeoutMs}`]),
-        "",
-        body,
-      ].join("\n");
-    })
-    .join("\n\n---\n\n");
+const RESULT_SEPARATOR = "\n\n---\n\n";
+const RESULT_OUTPUT_PREVIEW_ROWS = 3;
+type ResultOutputRange = { start: number; end: number };
+type ResultRenderDetails = { outputRanges?: ResultOutputRange[] };
+
+function formatResults(results: JobResult[]): { text: string; outputRanges: ResultOutputRange[] } {
+  let text = "";
+  const outputRanges: ResultOutputRange[] = [];
+  for (const result of results) {
+    if (text) text += RESULT_SEPARATOR;
+    text += [
+      `## ${result.id} — ${result.task}`,
+      "",
+      `status: ${resultStatus(result)}`,
+      ...("shell" in result
+        ? [`shell: ${result.shell}`, `exit_code: ${result.exitCode ?? "unavailable"}`]
+        : [
+            `profile: ${result.profile}`,
+            `model_set: ${result.modelSet ?? "baseline"}`,
+            `model_set_source: ${result.modelSetSource}`,
+            `model: ${configuredValue(result.model)}`,
+            `thinking: ${configuredValue(result.thinkingLevel)}`,
+            ...(result.tools === undefined ? [] : [`tools: ${result.tools.join(",")}`]),
+          ]),
+      `duration_ms: ${result.durationMs}`,
+      ...(result.queueWaitMs === undefined ? [] : [`queue_wait_ms: ${result.queueWaitMs}`]),
+      ...(result.timeoutMs === undefined ? [] : [`timeout_ms: ${result.timeoutMs}`]),
+    ].join("\n") + "\n\n";
+    const start = text.length;
+    text += result.output.trim() || "(no output)";
+    outputRanges.push({ start, end: text.length });
+  }
+  return { text, outputRanges };
+}
+
+function renderResults(text: string, outputRanges: ResultOutputRange[] | undefined, expanded: boolean, theme: Theme) {
+  const displayText = (value: string) => new Text(
+    theme.fg("toolOutput", stripVTControlCharacters(value).replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "")), 0, 0,
+  );
+  if (expanded || outputRanges?.at(-1)?.end !== text.length) return displayText(text);
+
+  const shortcut = keyText("app.tools.expand");
+  const hint = new TruncatedText(theme.fg("muted", shortcut ? `… ${shortcut} to expand` : "… more output"));
+  const results = new Container();
+  let offset = 0;
+  for (const { start, end } of outputRanges) {
+    if (offset > 0) {
+      results.addChild(new Spacer(1));
+      results.addChild(displayText(RESULT_SEPARATOR.trim()));
+      results.addChild(new Spacer(1));
+      offset += RESULT_SEPARATOR.length;
+    }
+    results.addChild(displayText(text.slice(offset, start - 2)));
+    results.addChild(new Spacer(1));
+    const output = displayText(text.slice(start, end));
+    results.addChild({
+      render(width) {
+        const lines = output.render(width);
+        if (lines.length <= RESULT_OUTPUT_PREVIEW_ROWS) return lines;
+        return [...lines.slice(0, RESULT_OUTPUT_PREVIEW_ROWS), ...hint.render(width)];
+      },
+      invalidate: () => output.invalidate(),
+    });
+    offset = end;
+  }
+  return results;
 }
 
 function getWorkerUiState(status: string): WorkerUiState {
@@ -991,6 +1035,13 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
     ),
   });
 
+  pi.registerMessageRenderer<ResultRenderDetails>("delegate-job-result", (message, options, theme) => {
+    if (typeof message.content !== "string") return undefined;
+    const box = new Box(options.outputPad ?? 1, 1, (text) => theme.bg("customMessageBg", text));
+    box.addChild(renderResults(message.content, message.details?.outputRanges, options.expanded, theme));
+    return box;
+  });
+
   pi.registerTool({
     name: "delegate_tasks",
     label: "Delegate Tasks",
@@ -1032,6 +1083,10 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
         }),
       ),
     }),
+    renderResult(result: AgentToolResult<ResultRenderDetails>, options, theme) {
+      const text = result.content.flatMap((block) => block.type === "text" ? [block.text] : []).join("\n");
+      return renderResults(text, result.details?.outputRanges, options.expanded, theme);
+    },
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       const sessionSignal = lifetime.signal;
       const submissionSignal = signal ? AbortSignal.any([signal, sessionSignal]) : sessionSignal;
@@ -1084,19 +1139,15 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
             maxDepth,
           }).then((result) => {
             if (background && !sessionSignal.aborted) {
+              const { text, outputRanges } = formatResults([result]);
+              const status = resultStatus(result);
               pi.sendMessage({
                 customType: "delegate-job-result",
-                content: formatResults([result]),
+                content: text,
                 display: true,
-                details: { id, status: resultStatus(result), usage: result.usage },
+                details: { id, status, usage: result.usage, outputRanges },
               }, { triggerTurn: false });
-              if (ctx.hasUI) {
-                const preview = compactActivity(result.output, 180);
-                ctx.ui.notify(
-                  `Delegate job ${id}: ${resultStatus(result)}${preview ? ` — ${preview}` : ""}`,
-                  result.ok ? "info" : "warning",
-                );
-              }
+              if (ctx.hasUI) ctx.ui.notify(`Delegate job ${id}: ${status}`, result.ok ? "info" : "warning");
             }
             return result;
           }).finally(() => jobs.delete(done));
@@ -1127,16 +1178,17 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
         }
       }
 
-      const combined = formatResults(results);
+      const { text, outputRanges } = formatResults(results);
       const failed = results.filter((result) => !result.ok).length;
       const cancelled = results.filter((result) => result.cancelled).length;
       const timedOut = results.filter((result) => result.timedOut).length;
       const usage = sumUsage(results.map((result) => result.usage));
 
       return {
-        content: [{ type: "text", text: combined }],
+        content: [{ type: "text", text }],
         usage,
         details: {
+          outputRanges,
           taskCount: results.length,
           failedTasks: failed,
           cancelledTasks: cancelled,
