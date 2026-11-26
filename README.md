@@ -191,6 +191,12 @@ pi --mode rpc --no-session --model provider/model --thinking medium --tools ...
 
 The same model and thinking level are used for investigation and the worker's synthesis pass. For blocking calls, usage from both passes, nested worker tools, and worker compaction is aggregated into the `delegate_tasks` tool result. Pi includes it in the parent session footer, `/session`, and RPC session totals.
 
+### Query job status
+
+The main agent can call `delegate_status` with `{}` to list active jobs or with `{ "id": "w3" }` to look up one job. The tool returns a snapshot immediately; it does not wait for workers. It covers direct agent and shell jobs, not nested workers. The snapshot includes the job ID, state, a short label, and progress or the worker tool name when available. `cancelling` means a cancellation was requested but the job has not stopped yet.
+
+Lookup by ID also covers the last 50 finished jobs in the current session. Session switches and reloads clear this history. A missing ID does not imply the job is still running. Use the job result for full output.
+
 ## Environment settings
 
 - `PI_DELEGATE_PI_BIN` — worker pi binary/path (default: `pi`)

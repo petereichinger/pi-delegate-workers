@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { runTask } from "../extensions/index.ts";
+import { activeJobStatus, runTask } from "../extensions/index.ts";
 import {
   appendBoundedText,
   emptyUsage,
@@ -30,18 +30,29 @@ test("investigation and synthesis use distinct capture limits and report clipped
     ui: { theme: { fg: (_color: string, text: string) => text }, setWidget: () => undefined },
   } as any;
   let prompts = 0;
+  const workers: Parameters<typeof runTask>[1] = new Map();
+  const snapshots: ReturnType<typeof activeJobStatus>[] = [];
   const result = await runTask(
     ctx,
-    new Map(),
+    workers,
     { task: "report", profile: "balanced", modelSetSource: "none" },
     "w1",
     {
       uiDialogQueue: createRpcUiDialogQueue(),
       reportInputStatus: () => undefined,
       createWorker: (() => ({
-        prompt: async (_message: string, options: { maxTextChars?: number } = {}) => {
-          requestedLimits.push(options.maxTextChars!);
-          return ++prompts === 1
+        prompt: async (_message: string, { maxTextChars, onEvent }: { maxTextChars: number; onEvent: (event: unknown) => void }) => {
+          requestedLimits.push(maxTextChars);
+          ++prompts;
+          onEvent({ type: "agent_start" });
+          onEvent({ type: "tool_execution_start", toolCallId: "first", toolName: "read", args: { path: "private.txt" } });
+          onEvent({ type: "tool_execution_start", toolCallId: "second", toolName: "bash", args: { command: "private command" } });
+          snapshots.push(activeJobStatus(workers.get("w1")!));
+          onEvent({ type: "tool_execution_end", toolCallId: "second" });
+          snapshots.push(activeJobStatus(workers.get("w1")!));
+          onEvent({ type: "tool_execution_end", toolCallId: "first" });
+          snapshots.push(activeJobStatus(workers.get("w1")!));
+          return prompts === 1
             ? { text: "investigation", truncated: true }
             : { text: "summary", truncated: true };
         },
@@ -53,6 +64,15 @@ test("investigation and synthesis use distinct capture limits and report clipped
   );
 
   assert.deepEqual(requestedLimits, [MAX_INVESTIGATION_TEXT_CHARS, MAX_SYNTHESIS_TEXT_CHARS]);
+  const base = { id: "w1", label: "report" };
+  assert.deepEqual(snapshots, [
+    { ...base, status: "running", tool: "bash" },
+    { ...base, status: "running", tool: "read" },
+    { ...base, status: "running", progress: "Thinking about the next step" },
+    { ...base, status: "synthesizing", tool: "bash" },
+    { ...base, status: "synthesizing", tool: "read" },
+    { ...base, status: "synthesizing", progress: "Synthesizing findings" },
+  ]);
   assert.equal(result.rawOutput, "investigation");
   assert.equal(result.output, "summary\n\n[synthesis text truncated before returning to parent agent]");
 });

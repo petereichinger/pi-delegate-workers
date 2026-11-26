@@ -32,7 +32,7 @@ function runtime(t: TestContext, deny?: string | null, settings = {}) {
     authorizations.push(request.command);
     request.respond(Promise.resolve(deny));
   });
-  const handlers = new Map<string, () => Promise<void>>();
+  const handlers = new Map<string, (event?: unknown, ctx?: ExtensionToolContext) => Promise<void>>();
   const commands = new Map<string, { handler: (args: string, ctx: ExtensionToolContext) => Promise<void> }>();
   const messages: Array<{
     customType: string; display: boolean; content: string;
@@ -49,12 +49,16 @@ function runtime(t: TestContext, deny?: string | null, settings = {}) {
     execute(id: string, params: unknown, signal: AbortSignal | undefined, update: undefined, ctx: ExtensionToolContext): Promise<any>;
     renderResult(result: AgentToolResult<unknown>, options: ToolRenderResultOptions, theme: Theme): Component;
   };
+  let statusTool: Pick<typeof tool, "execute">;
   delegateWorkersExtension({
     events,
     getSettings: () => settings,
     on: (name: string, handler: () => Promise<void>) => handlers.set(name, handler),
     registerCommand: (name: string, command: never) => commands.set(name, command),
-    registerTool: (definition: typeof tool) => { tool = definition; },
+    registerTool: (definition: typeof tool & { name: string }) => {
+      if (definition.name === "delegate_tasks") tool = definition;
+      if (definition.name === "delegate_status") statusTool = definition;
+    },
     registerMessageRenderer: (name: string, renderer: MessageRenderer) => renderers.set(name, renderer),
     sendMessage: (message: Omit<(typeof messages)[number], "options">, options: { triggerTurn: boolean }) => messages.push({ ...message, options }),
   } as unknown as ExtensionAPI);
@@ -70,6 +74,8 @@ function runtime(t: TestContext, deny?: string | null, settings = {}) {
   });
   return {
     cwd, messages, notifications, authorizations, stop,
+    start: () => handlers.get("session_start")!({ type: "session_start" }, ctx),
+    status: (id?: string) => statusTool.execute("status-call", id === undefined ? {} : { id }, undefined, undefined, ctx),
     execute: (params: unknown, signal?: AbortSignal) => tool.execute("test-call", params, signal, undefined, ctx),
     renderToolResult: (result: AgentToolResult<unknown>, expanded: boolean) =>
       tool.renderResult(result, { expanded, isPartial: false }, theme).render(60).map((line) => line.trim()),
@@ -96,6 +102,7 @@ test("background commands return job IDs and deliver independently after the cal
   turn.abort();
   await until(() => r.messages.length === 1);
   assert.equal(r.messages[0]?.details.id, "w2");
+  assert.deepEqual((await r.status("w2")).details.jobs, [{ id: "w2", label: "printf fast; printf stderr >&2; exit 7", status: "error" }]);
   assert.match(r.messages[0]!.content, /exit_code: 7/);
   assert.match(r.messages[0]!.content, /stderr/);
   assert.match(r.messages[0]!.content, /fast/);
@@ -106,6 +113,41 @@ test("background commands return job IDs and deliver independently after the cal
   assert.equal(r.messages[1]?.details.status, "ok");
   assert.match(r.messages[1]!.content, /exit_code: 0/);
   assert.equal(r.messages[1]?.details.id, "w1");
+});
+
+test("delegate_status lists queued and running jobs and looks up finished jobs by ID", async (t) => {
+  const r = runtime(t, null);
+  assert.match((await r.status()).content[0].text, /No active delegate jobs/);
+  assert.match((await r.status("w99")).content[0].text, /not found/);
+  await r.execute({ mode: "background", commands: [
+    { command: "touch started1; while [ ! -f release ]; do sleep 0.05; done" },
+    { command: "touch started2; while [ ! -f release ]; do sleep 0.05; done" },
+  ] });
+  await until(() => existsSync(join(r.cwd, "started1")) && existsSync(join(r.cwd, "started2")));
+  await r.execute({ mode: "background", commands: [{ command: "printf third" }] });
+  const active = (await r.status()).details.jobs;
+  assert.equal(active.length, 3);
+  assert.equal(active.find((job: { id: string }) => job.id === "w1")?.status, "running");
+  assert.deepEqual((await r.status("W3")).details.jobs, [{
+    id: "w3", label: "printf third", status: "queued", progress: "Waiting for a worker slot",
+  }]);
+  writeFileSync(join(r.cwd, "release"), "");
+  await until(() => r.messages.length === 3);
+  assert.deepEqual((await r.status()).details.jobs, []);
+  assert.deepEqual((await r.status("w3")).details.jobs, [{ id: "w3", label: "printf third", status: "ok" }]);
+  await r.start();
+  assert.match((await r.status("w3")).content[0].text, /not found/);
+});
+
+test("delegate_status retains no more than 50 finished jobs", async (t) => {
+  const r = runtime(t, null);
+  await r.execute({ commands: [{ command: ":" }] });
+  for (let batch = 0; batch < 25; batch++) {
+    await r.execute({ commands: [{ command: ":" }, { command: ":" }] });
+  }
+  assert.match((await r.status("w1")).content[0].text, /not found/);
+  assert.equal((await r.status("w2")).details.jobs[0]?.status, "ok");
+  assert.equal((await r.status("w51")).details.jobs[0]?.status, "ok");
 });
 
 test("command delegation fails closed if policy is missing or denies the request", async (t) => {
@@ -187,9 +229,12 @@ test("cancel-worker stops an active command and posts its final status", async (
   const r = runtime(t, null);
   await r.execute({ mode: "background", commands: [{ command: "touch started; sleep 60; touch finished" }] });
   await until(() => existsSync(join(r.cwd, "started")));
-  await r.cancel("w1");
+  const cancellation = r.cancel("w1");
+  assert.equal((await r.status("w1")).details.jobs[0]?.status, "cancelling");
+  await cancellation;
   await until(() => r.messages.length === 1);
   assert.equal(r.messages[0]?.details.status, "cancelled");
+  assert.equal((await r.status("w1")).details.jobs[0]?.status, "cancelled");
   assert.equal(existsSync(join(r.cwd, "finished")), false);
 });
 
@@ -197,6 +242,7 @@ test("a deadline reports timeout and session shutdown suppresses background comp
   const r = runtime(t, null);
   const timed = await r.execute({ commands: [{ command: "sleep 60", timeoutMs: 200 }] });
   assert.match(timed.content[0].text, /status: timed out/);
+  assert.equal((await r.status("w1")).details.jobs[0]?.status, "timed out");
   await r.execute({ mode: "background", commands: [{ command: "touch started; sleep 60; touch finished" }] });
   await until(() => existsSync(join(r.cwd, "started")));
   await r.stop();
