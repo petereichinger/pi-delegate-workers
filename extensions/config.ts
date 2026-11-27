@@ -19,8 +19,17 @@ export type DelegateProfileConfig = {
   thinkingLevel?: ThinkingLevel | null;
 };
 
+export type DelegateTierConfig = {
+  id: string;
+  model: string;
+  thinkingLevel?: ThinkingLevel;
+  advisorOnly?: boolean;
+};
+
 export type DelegateModelSetConfig = {
+  tiers?: DelegateTierConfig[];
   profiles?: Partial<Record<ProfileName, DelegateProfileConfig>>;
+  profileTiers?: Partial<Record<ProfileName, string>>;
 };
 
 export type ParentModelRoute = {
@@ -67,7 +76,8 @@ const ROOT_FIELDS = new Set([
   "parentModelRoutes",
 ]);
 const PROFILE_FIELDS = new Set(["model", "thinkingLevel"]);
-const MODEL_SET_FIELDS = new Set(["profiles"]);
+const MODEL_SET_FIELDS = new Set(["profiles", "tiers"]);
+const TIER_FIELDS = new Set(["id", "model", "thinkingLevel", "advisorOnly"]);
 const ROUTE_FIELDS = new Set(["models", "modelSet"]);
 const MODEL_SET_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const MODEL_PATTERN = /^[^/\s]+\/[^/\s][^\s]*$/;
@@ -153,6 +163,80 @@ function decodeModelSetName(value: unknown, label: string): string {
   return value;
 }
 
+function decodeTiers(
+  value: unknown,
+  label: string,
+  warnings: string[],
+): DelegateTierConfig[] {
+  if (!Array.isArray(value)) throw new TypeError(`${label} must be an array`);
+  const ids = new Set<string>();
+  return value.map((rawTier, index) => {
+    const tierLabel = `${label}[${index}]`;
+    const tier = objectValue(rawTier, tierLabel);
+    for (const field of Object.keys(tier)) {
+      if (!TIER_FIELDS.has(field)) {
+        warnings.push(`unknown ${tierLabel} field ignored: ${field}`);
+      }
+    }
+    const id = decodeModelSetName(tier.id, `${tierLabel}.id`);
+    if (ids.has(id)) throw new TypeError(`${label} contains duplicate tier id: ${id}`);
+    ids.add(id);
+    if (typeof tier.model !== "string" || !MODEL_PATTERN.test(tier.model)) {
+      throw new TypeError(`${tierLabel}.model must be a provider/model string`);
+    }
+    const decoded: DelegateTierConfig = { id, model: tier.model };
+    if (tier.thinkingLevel !== undefined) {
+      if (typeof tier.thinkingLevel !== "string" || !THINKING_LEVEL_SET.has(tier.thinkingLevel)) {
+        throw new TypeError(`${tierLabel}.thinkingLevel must be one of: ${THINKING_LEVELS.join(", ")}`);
+      }
+      decoded.thinkingLevel = tier.thinkingLevel as ThinkingLevel;
+    }
+    if (tier.advisorOnly !== undefined) {
+      if (typeof tier.advisorOnly !== "boolean") {
+        throw new TypeError(`${tierLabel}.advisorOnly must be a boolean`);
+      }
+      decoded.advisorOnly = tier.advisorOnly;
+    }
+    return decoded;
+  });
+}
+
+function decodeModelSet(
+  value: unknown,
+  label: string,
+  warnings: string[],
+): DelegateModelSetConfig {
+  const modelSet = objectValue(value, label);
+  for (const field of Object.keys(modelSet)) {
+    if (!MODEL_SET_FIELDS.has(field)) {
+      warnings.push(`unknown ${label} field ignored: ${field}`);
+    }
+  }
+  const decoded: DelegateModelSetConfig = {};
+  if (modelSet.tiers !== undefined) {
+    decoded.tiers = decodeTiers(modelSet.tiers, `${label}.tiers`, warnings);
+  }
+  if (modelSet.profiles !== undefined) {
+    const profiles = objectValue(modelSet.profiles, `${label}.profiles`);
+    decoded.profiles = {};
+    for (const [name, profile] of Object.entries(profiles)) {
+      if (!PROFILE_NAME_SET.has(name)) {
+        warnings.push(`unknown ${label}.profiles profile ignored: ${name}`);
+        continue;
+      }
+      const profileName = name as ProfileName;
+      const profileLabel = `${label}.profiles.${name}`;
+      if (typeof profile === "string") {
+        decoded.profileTiers ??= {};
+        decoded.profileTiers[profileName] = decodeModelSetName(profile, profileLabel);
+      } else {
+        decoded.profiles[profileName] = decodeProfile(profile, profileLabel, warnings);
+      }
+    }
+  }
+  return decoded;
+}
+
 export function decodeDelegateConfig(value: unknown): {
   value: DelegateConfig;
   warnings: string[];
@@ -200,23 +284,11 @@ export function decodeDelegateConfig(value: unknown): {
         continue;
       }
 
-      const modelSet = objectValue(rawModelSet, `modelSets.${name}`);
-      for (const field of Object.keys(modelSet)) {
-        if (!MODEL_SET_FIELDS.has(field)) {
-          warnings.push(`unknown modelSets.${name} field ignored: ${field}`);
-        }
-      }
-      config.modelSets[name] = {
-        ...(modelSet.profiles === undefined
-          ? {}
-          : {
-              profiles: decodeProfiles(
-                modelSet.profiles,
-                `modelSets.${name}.profiles`,
-                warnings,
-              ),
-            }),
-      };
+      config.modelSets[name] = decodeModelSet(
+        rawModelSet,
+        `modelSets.${name}`,
+        warnings,
+      );
     }
   }
 
@@ -309,9 +381,26 @@ export function mergeDelegateConfigs(
         target = {};
         merged.modelSets[name] = target;
       }
+      if (modelSet.tiers !== undefined) {
+        target.tiers = modelSet.tiers.map((tier) => ({ ...tier }));
+      }
       if (modelSet.profiles) {
         target.profiles ??= {};
+        for (const profileName of PROFILE_NAMES) {
+          if (modelSet.profiles[profileName] !== undefined) {
+            delete target.profileTiers?.[profileName];
+          }
+        }
         mergeProfiles(target.profiles, modelSet.profiles);
+      }
+      if (modelSet.profileTiers) {
+        target.profileTiers ??= {};
+        for (const profileName of PROFILE_NAMES) {
+          const tierId = modelSet.profileTiers[profileName];
+          if (tierId === undefined) continue;
+          delete target.profiles?.[profileName];
+          target.profileTiers[profileName] = tierId;
+        }
       }
     }
 
@@ -333,6 +422,19 @@ export function mergeDelegateConfigs(
       throw new TypeError(
         `parentModelRoutes[${index}] references unknown model set: ${route.modelSet}`,
       );
+    }
+  }
+
+  for (const [name, modelSet] of Object.entries(merged.modelSets)) {
+    for (const profileName of PROFILE_NAMES) {
+      const tierId = modelSet.profileTiers?.[profileName];
+      if (tierId === undefined) continue;
+      const tier = modelSet.tiers?.find((entry) => entry.id === tierId);
+      const label = `modelSets.${name}.profiles.${profileName}`;
+      if (!tier) throw new TypeError(`${label} references unknown tier: ${tierId}`);
+      if (tier.advisorOnly) {
+        throw new TypeError(`${label} references advisorOnly tier: ${tierId}`);
+      }
     }
   }
 

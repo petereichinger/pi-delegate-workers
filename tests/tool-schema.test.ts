@@ -41,7 +41,9 @@ function registeredTool() {
     on: () => undefined,
     registerCommand: () => undefined,
     registerMessageRenderer: () => undefined,
-    registerTool: (registered: unknown) => { tool = registered; },
+    registerTool: (registered: { name: string }) => {
+      if (registered.name === "delegate_tasks") tool = registered;
+    },
   } as any);
   return tool;
 }
@@ -137,23 +139,26 @@ test("nesting is enabled at depth one by default, disabled at depth two or with 
 });
 
 test("delegate_tasks accepts structured tasks without a legacy string adapter", () => {
-  const tool = registeredTool();
-
-  assert.equal(tool.prepareArguments, undefined);
-  assert.equal(Check(tool.parameters, { tasks: [{ task: "inspect" }] }), true);
-  assert.equal(Check(tool.parameters, { tasks: ["inspect"] }), false);
+  withWorkerEnvironment(0, undefined, () => {
+    const tool = registeredTool();
+    assert.equal(tool.prepareArguments, undefined);
+    assert.equal(Check(tool.parameters, { tasks: [{ task: "inspect" }] }), true);
+    assert.equal(Check(tool.parameters, { tasks: ["inspect"] }), false);
+  });
 });
 
 test("delegate_tasks validates optional string enums", () => {
-  const { parameters } = registeredTool();
-  const { tasks, commands, mode } = parameters.properties;
-  for (const schema of [tasks.items.properties.profile, commands.items.properties.shell, mode]) {
-    assert.equal(schema.type, "string");
-    assert.ok(Array.isArray(schema.enum));
-  }
-  assert.equal(Check(parameters, { tasks: [{ task: "inspect", profile: "fast" }], mode: "background" }), true);
-  assert.equal(Check(parameters, { commands: [{ command: ":", shell: "bash" }] }), true);
-  assert.equal(Check(parameters, { tasks: [{ task: "inspect", profile: "unknown" }] }), false);
-  assert.equal(Check(parameters, { commands: [{ command: ":", shell: "unknown" }] }), false);
-  assert.equal(Check(parameters, { tasks: [{ task: "inspect" }], mode: "unknown" }), false);
+  withWorkerEnvironment(0, undefined, () => {
+    const { parameters } = registeredTool();
+    const { tasks, commands, mode } = parameters.properties;
+    for (const schema of [tasks.items.properties.profile, commands.items.properties.shell, mode]) {
+      assert.equal(schema.type, "string");
+      assert.ok(Array.isArray(schema.enum));
+    }
+    assert.equal(Check(parameters, { tasks: [{ task: "inspect", profile: "fast" }], mode: "background" }), true);
+    assert.equal(Check(parameters, { commands: [{ command: ":", shell: "bash" }] }), true);
+    assert.equal(Check(parameters, { tasks: [{ task: "inspect", profile: "unknown" }] }), false);
+    assert.equal(Check(parameters, { commands: [{ command: ":", shell: "unknown" }] }), false);
+    assert.equal(Check(parameters, { tasks: [{ task: "inspect" }], mode: "unknown" }), false);
+  });
 });

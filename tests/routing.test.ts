@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import {
   formatModelSetNotification,
   normalizeWorkerId,
@@ -178,7 +178,17 @@ test("rejects model-specific unsupported thinking levels before spawn", () => {
   );
 });
 
-test("selects a model set from the current parent model before the default", () => {
+function allowConsultation(t: TestContext) {
+  const previous = process.env.PI_DELEGATE_TOOLS;
+  process.env.PI_DELEGATE_TOOLS = "consult_advisor";
+  t.after(() => {
+    if (previous === undefined) delete process.env.PI_DELEGATE_TOOLS;
+    else process.env.PI_DELEGATE_TOOLS = previous;
+  });
+}
+
+test("selects a model set from the current parent model before the default", (t) => {
+  allowConsultation(t);
   const routedConfig: ResolvedDelegateConfig = {
     ...config,
     defaultModelSet: "diverse",
@@ -216,12 +226,14 @@ test("selects a model set from the current parent model before the default", () 
         modelSetSource: "parent-model",
         model: "test/large",
         thinkingLevel: "max",
+        advisorTiers: [{ id: "deep", model: "test/large", thinkingLevel: "max" }],
       }],
     );
   }
 });
 
-test("task model set overrides automatic routing and overlays the baseline profile", () => {
+test("task model set overrides automatic routing and overlays the baseline profile", (t) => {
+  allowConsultation(t);
   const routedConfig: ResolvedDelegateConfig = {
     ...config,
     defaultModelSet: "claude",
@@ -244,6 +256,7 @@ test("task model set overrides automatic routing and overlays the baseline profi
       modelSetSource: "task",
       model: "test/small",
       thinkingLevel: "medium",
+      advisorTiers: [{ id: "deep", model: "test/large", thinkingLevel: "max" }],
     }],
   );
   assert.throws(
@@ -267,6 +280,7 @@ test("task model set overrides automatic routing and overlays the baseline profi
       modelSetSource: "default",
       model: "test/large",
       thinkingLevel: "low",
+      advisorTiers: [{ id: "deep", model: "test/large", thinkingLevel: "max" }],
     }],
   );
 });

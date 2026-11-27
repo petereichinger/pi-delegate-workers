@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { ADVISOR_TIERS_ENV, ADVISOR_TOOL } from "../extensions/advisor.ts";
 import { runTask } from "../extensions/index.ts";
 import { createRpcWorker } from "../extensions/rpc-worker.ts";
 import { createRpcUiDialogQueue } from "../extensions/ui-dialog-queue.ts";
@@ -339,6 +340,36 @@ test("nested workers inherit coordinator identity, but depth-two workers cannot 
     child.dispose();
     if (previousGuard === undefined) delete process.env.PI_DELEGATE_TOOL_GUARD;
     else process.env.PI_DELEGATE_TOOL_GUARD = previousGuard;
+  }
+});
+
+test("worker launches pass only the worker's advisor tiers, even without nested delegation", () => {
+  const previous = process.env[ADVISOR_TIERS_ENV];
+  process.env[ADVISOR_TIERS_ENV] = "stale-tiers";
+  const advisorTiers = [{ id: "review", model: "test/advisor" }];
+  const launches: Array<{ args: string[]; env?: NodeJS.ProcessEnv }> = [];
+  const options: Parameters<typeof createRpcWorker>[0] = {
+    cwd: process.cwd(), tools: ["read"], coordinatorEndpoint: "endpoint",
+    workerToken: "worker-token", workerDepth: 2, maxDepth: 2,
+    spawnWorker(_bin, args, spawnOptions) {
+      launches.push({ args, env: spawnOptions.env });
+      return spawn(process.execPath, [fixture, "stall"], spawnOptions);
+    },
+  };
+  const workers: ReturnType<typeof createRpcWorker>[] = [];
+  try {
+    workers.push(createRpcWorker({ ...options, tools: ["read", ADVISOR_TOOL], advisorTiers }));
+    workers.push(createRpcWorker(options));
+    const [eligible, ineligible] = launches;
+    assert.equal(eligible!.env?.[ADVISOR_TIERS_ENV], JSON.stringify(advisorTiers));
+    assert.equal(ineligible!.env?.[ADVISOR_TIERS_ENV], undefined);
+    assert.ok(eligible!.args.some((arg) => /extensions[/\\\\]index\.ts$/.test(arg)));
+    assert.ok(!ineligible!.args.some((arg) => /extensions[/\\\\]index\.ts$/.test(arg)));
+    assert.equal(eligible!.args[eligible!.args.indexOf("--tools") + 1], `read,${ADVISOR_TOOL}`);
+  } finally {
+    for (const worker of workers) worker.dispose();
+    if (previous === undefined) delete process.env[ADVISOR_TIERS_ENV];
+    else process.env[ADVISOR_TIERS_ENV] = previous;
   }
 });
 

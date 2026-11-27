@@ -14,6 +14,8 @@ The agent decides what to delegate from normal prompts. Work that needs reasonin
 - session-wide coordinator queues jobs across overlapping calls and limits concurrent execution
 - one-level nested delegation by default, with a shared coordinator and descendant cancellation
 - per-profile model and thinking level configuration
+- ordered model tiers with blocking, tool-free advisor consultations for eligible workers
+- persistent `/advisor` selection for the parent agent without changing its session model
 - automatic model-set selection from the active parent model
 - per-task model-set overrides for aligned or cross-model delegation
 - global, Git-repository, and current-directory JSON configuration
@@ -21,7 +23,7 @@ The agent decides what to delegate from normal prompts. Work that needs reasonin
 - progress text and current tool activity streamed from each worker over RPC
 - per-worker synthesis before returning results to the parent
 - worker token and cost usage added to the parent session totals
-- default worker tools include `codemode` and `tool_search`, plus `delegate_tasks` for depth-one workers; depth-two workers cannot delegate; optional per-task tool subsets
+- default worker tools include `codemode` and `tool_search`, plus `consult_advisor` where eligible and `delegate_tasks` for depth-one workers; depth-two workers cannot delegate; optional per-task tool subsets
 
 The parent agent selects profiles using this rubric:
 
@@ -71,10 +73,16 @@ All files are optional. They are deeply merged in this order:
   "defaultModelSet": "diverse",
   "modelSets": {
     "claude": {
+      "tiers": [
+        { "id": "quick", "model": "anthropic/claude-haiku", "thinkingLevel": "low" },
+        { "id": "standard", "model": "anthropic/claude-sonnet", "thinkingLevel": "medium" },
+        { "id": "thorough", "model": "anthropic/claude-opus", "thinkingLevel": "high" },
+        { "id": "advisor", "model": "anthropic/claude-opus", "thinkingLevel": "max", "advisorOnly": true }
+      ],
       "profiles": {
-        "fast": { "model": "anthropic/claude-haiku" },
-        "balanced": { "model": "anthropic/claude-sonnet" },
-        "deep": { "model": "anthropic/claude-opus" }
+        "fast": "quick",
+        "balanced": "standard",
+        "deep": "thorough"
       }
     },
     "diverse": {
@@ -96,7 +104,9 @@ All files are optional. They are deeply merged in this order:
 
 Valid thinking levels are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. Models must use an exact `provider/model` identifier. Parent model routes use minimatch-compatible `provider/model` patterns and the first matching route wins. The extension resolves configured worker models through pi's model registry and verifies model-specific thinking-level support before spawning workers.
 
-Model sets overlay the top-level profiles. In the example, each set supplies worker models while the top-level profiles supply shared thinking levels. Existing configurations without model sets keep their current behavior.
+Model sets overlay the top-level profiles. `modelSets.<name>.tiers` is an ordered array from lowest to highest rank. Each tier has an `id` and exact `model`, with optional `thinkingLevel` and `advisorOnly`. An advisor-only tier is available for consultation, not as a worker profile. Profile strings are aliases to tier IDs in that set; the `claude` example maps the three worker profiles to tiers and reserves the last tier for advice. A tier alias uses the tier's model and thinking level, not the top-level profile. If the tier omits the thinking level, Pi uses its startup setting for a worker and the provider default for a consultation.
+
+Legacy profile objects remain supported, including configurations without model sets. In the `diverse` example, model-set profile objects supply models while top-level profiles supply thinking levels. For a named legacy model set without explicit tiers, advisor tiers are inferred from explicitly resolved models in `fast`, `balanced`, `deep` order. In an explicitly tiered set, a profile that uses a legacy object instead of a tier alias has no known rank, so it cannot use worker tier escalation.
 
 For each task, model-set selection uses this precedence:
 
@@ -132,7 +142,7 @@ Set a profile property to `null` to clear an inherited value and use pi's startu
 }
 ```
 
-Named model sets are deeply merged across scopes. Set a model-set entry to `null` to remove it, or set `defaultModelSet` to `null` to clear the inherited default. `parentModelRoutes` is ordered, so a narrower scope replaces the complete inherited route list; set it to `null` to clear all inherited routes.
+Named model sets are deeply merged across scopes. Arrays replace inherited arrays rather than merging their entries: a narrower scope replaces the complete `tiers` or `parentModelRoutes` list. Set a model-set entry to `null` to remove it, or set `defaultModelSet` to `null` to clear the inherited default. Set `parentModelRoutes` to `null` to clear all inherited routes.
 
 ## What to prompt
 
@@ -181,7 +191,7 @@ The profile is optional and falls back to `defaultProfile`. Leave `modelSet` out
 
 `timeoutMs` is optional per task and must be an integer from 1 to 2,147,483,647 milliseconds. It covers both the investigation and synthesis passes, starting when the worker is launched, not while it waits in the queue. Without it, the task has no deadline. An expired task stops its worker process and reports `timed out` separately from cancellation and other errors; usage recorded before expiry is still included.
 
-`tools` is an optional non-empty array of distinct tool names for one task. It must be a subset of `PI_DELEGATE_TOOLS` (or the default `read,write,edit,bash,codemode,tool_search,delegate_tasks` for depth-one workers; depth-two workers cannot delegate). For read-only tasks, use `"tools": ["read", "codemode", "tool_search"]` when all three tools are in the worker allowlist. Do not exclude `codemode` or `tool_search` just because the task is read-only. Add `bash` only when command access is needed. Explicit tool restrictions remain authoritative; no tools are added automatically. `codemode` runs JavaScript scripts that call available tools; `tool_search` finds and declares deferred tools, such as MCP tools. Both are available by default at either depth. To allow file search tools (`grep`, `find`, or `ls`) in a subset, first add them to `PI_DELEGATE_TOOLS`. Omitting `tools` preserves the current worker behavior.
+`tools` is an optional non-empty array of distinct tool names for one task. It must be a subset of `PI_DELEGATE_TOOLS` (or the default `read,write,edit,bash,codemode,tool_search,delegate_tasks,consult_advisor` for eligible depth-one workers; depth-two workers cannot delegate, and `consult_advisor` is available only where a higher tier exists). For read-only tasks, use `"tools": ["read", "codemode", "tool_search"]` when all three tools are in the worker allowlist. Do not exclude `codemode` or `tool_search` just because the task is read-only. Add `bash` only when command access is needed. Explicit tool restrictions remain authoritative; no tools are added automatically. `codemode` runs JavaScript scripts that call available tools; `tool_search` finds and declares deferred tools, such as MCP tools. Both are available by default at either depth. To allow file search tools (`grep`, `find`, or `ls`) in a subset, first add them to `PI_DELEGATE_TOOLS`. Omitting `tools` preserves the current worker behavior.
 
 Each worker starts with the resolved profile on its command line:
 
@@ -190,6 +200,23 @@ pi --mode rpc --no-session --model provider/model --thinking medium --tools ...
 ```
 
 The same model and thinking level are used for investigation and the worker's synthesis pass. For blocking calls, usage from both passes, nested worker tools, and worker compaction is aggregated into the `delegate_tasks` tool result. Pi includes it in the parent session footer, `/session`, and RPC session totals.
+
+### Consult an advisor
+
+An eligible worker can call `consult_advisor` with `{ "question": "Check this conclusion" }`. The default target is the next higher tier in its resolved model set. To jump to a specific higher tier, use `{ "question": "Check this conclusion", "target": "advisor" }`, where `target` is a tier ID. Workers at the top tier have no advisor. Explicit global (`PI_DELEGATE_TOOLS`) and per-task (`tools`) allowlists remain authoritative: include `consult_advisor` in each explicit list that applies to enable it where eligible. It is not added to restricted lists automatically.
+
+A consultation makes one blocking, tool-free model call with a five-minute timeout. It does not change the worker's model or start another delegation. Advisors cannot call tools, consult another advisor, or recursively escalate.
+
+The parent agent also has `consult_advisor`, controlled by `/advisor`:
+
+- `/advisor <set>/<tier>` selects a named model-set tier, including a tier from another provider.
+- `/advisor auto` uses the current parent model at its next supported thinking level, or the same level if there is no higher supported level. This is the default.
+- `/advisor off` disables parent consultations.
+- `/advisor` with no arguments shows the saved selection and its current resolution.
+
+The parent selection persists in `getAgentDir()/extensions/delegate-advisor.json` (`<agent-dir>/extensions/delegate-advisor.json`). Resolution is dynamic: changes to the active parent model or thinking level affect `auto` without changing the saved selection. Selecting or consulting an advisor never changes the parent session model. Parent selection is separate from worker tier escalation.
+
+Both parent and worker consultations send the question and bounded recent text from the active conversation to the target model's provider. This includes tool-result text, but not tool arguments, images, or reasoning. Conversation text is not automatically redacted; choose advisor providers accordingly. A worker tier or explicit parent selection can send this text to a different provider. Do not enable those routes for conversations you cannot share with that provider.
 
 ### Query job status
 
@@ -206,7 +233,7 @@ Use `{ "ids": ["w1", "w3"] }` to wait for only those jobs, including jobs that a
 ## Environment settings
 
 - `PI_DELEGATE_PI_BIN` — worker pi binary/path (default: `pi`)
-- `PI_DELEGATE_TOOLS` — comma-separated worker tool allowlist (default: `read,write,edit,bash,codemode,tool_search,delegate_tasks` at depth one; `read,write,edit,bash,codemode,tool_search` at depth two). An explicit value replaces these defaults.
+- `PI_DELEGATE_TOOLS` — comma-separated worker tool allowlist (default: `read,write,edit,bash,codemode,tool_search,delegate_tasks` at depth one; `read,write,edit,bash,codemode,tool_search` at depth two, plus `consult_advisor` where eligible at either depth). An explicit value replaces these defaults; include `consult_advisor` to permit eligible worker consultations.
 - `PI_DELEGATE_MAX_WORKERS` — maximum total agent tasks and command jobs per batch (default: `5`)
 - `PI_DELEGATE_MAX_ACTIVE_WORKERS` — maximum concurrently running jobs in one parent session (default: `10`)
 - `PI_DELEGATE_MAX_LIVE_WORKERS` — maximum live delegated jobs in one parent session, including workers that yield their active slot (default: `30`; must be at least the active limit, and at least `2` for nesting)

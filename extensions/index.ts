@@ -25,6 +25,7 @@ import {
   delegateConfigLoader,
   PROFILE_NAMES,
   type DelegateProfileConfig,
+  type DelegateTierConfig,
   type ProfileName,
   type ResolvedDelegateConfig,
 } from "./config.ts";
@@ -42,6 +43,7 @@ import {
 } from "./ui-dialog-queue.ts";
 import { createWidgetRefresh, type WidgetRefresh } from "./widget-refresh.ts";
 import { authorizeCommand, executeCommand, SHELLS, type CommandTask, type Shell } from "./command-task.ts";
+import { ADVISOR_TIERS_ENV, ADVISOR_TOOL, inheritedAdvisorTiers, registerAdvisor, routeWorkerTiers } from "./advisor.ts";
 
 type TaskRequest = {
   task: string;
@@ -62,6 +64,7 @@ type RoutedTask = {
   modelSetSource: ModelSetSource;
   model?: string | null;
   thinkingLevel?: DelegateProfileConfig["thinkingLevel"];
+  advisorTiers?: DelegateTierConfig[];
 };
 
 type WorkerState = {
@@ -140,15 +143,13 @@ function getDepth(): number {
 }
 const MAX_TIMEOUT_MS = 2_147_483_647;
 
-function getWorkerTools(): string[] {
+function getWorkerTools(canConsult = false): string[] {
   const raw = process.env.PI_DELEGATE_TOOLS?.trim();
-  const defaultTools = getMaxDepth() === 2 && getDepth() + 1 < 2
-    ? [...DEFAULT_TOOLS, "delegate_tasks"]
-    : DEFAULT_TOOLS;
-  if (!raw) return defaultTools;
-  const tools = raw.split(",").map((tool) => tool.trim()).filter(Boolean);
-  return (tools.length > 0 ? tools : defaultTools)
-    .filter((tool) => tool !== "delegate_tasks" || getMaxDepth() === 2 && getDepth() + 1 < 2);
+  const canDelegate = getMaxDepth() === 2 && getDepth() + 1 < 2;
+  const tools = raw?.split(",").map((tool) => tool.trim()).filter(Boolean);
+  return tools?.length
+    ? tools.filter((tool) => (tool !== "delegate_tasks" || canDelegate) && (tool !== ADVISOR_TOOL || canConsult))
+    : [...DEFAULT_TOOLS, ...(canDelegate ? ["delegate_tasks"] : []), ...(canConsult ? [ADVISOR_TOOL] : [])];
 }
 
 function positiveLimit(name: string, fallback: number): number {
@@ -225,20 +226,6 @@ export function routeTasks(
   config: ResolvedDelegateConfig,
 ): RoutedTask[] {
   return tasks.map((request) => {
-    let tools: string[] | undefined;
-    if (request.tools !== undefined) {
-      if (!Array.isArray(request.tools) || request.tools.length === 0) {
-        throw new Error("delegate-workers task tools must be a non-empty array");
-      }
-      const allowed = getWorkerTools();
-      tools = request.tools.map((tool) => typeof tool === "string" ? tool.trim() : "");
-      if (tools.some((tool) => !tool || !allowed.includes(tool))) {
-        throw new Error(`delegate-workers task tools must be a subset of the worker allowlist: ${allowed.join(", ")}`);
-      }
-      if (new Set(tools).size !== tools.length) {
-        throw new Error("delegate-workers task tools must not contain duplicates");
-      }
-    }
     checkTimeout(request.timeoutMs);
     const profile = request.profile ?? config.defaultProfile;
     const automatic = selectAutomaticModelSet(ctx.model, config);
@@ -254,10 +241,26 @@ export function routeTasks(
       );
     }
 
-    const profileConfig = {
-      ...config.profiles[profile],
-      ...config.modelSets[modelSet ?? ""]?.profiles?.[profile],
-    };
+    const route = modelSet === undefined ? undefined : routeWorkerTiers(config, modelSet, profile);
+    const higherTiers = route?.higherTiers ?? [];
+    const allowed = getWorkerTools(higherTiers.length > 0);
+    let tools: string[] | undefined;
+    if (request.tools !== undefined) {
+      if (!Array.isArray(request.tools) || request.tools.length === 0) {
+        throw new Error("delegate-workers task tools must be a non-empty array");
+      }
+      tools = request.tools.map((tool) => typeof tool === "string" ? tool.trim() : "");
+      if (tools.some((tool) => !tool || !allowed.includes(tool))) {
+        throw new Error(`delegate-workers task tools must be a subset of the worker allowlist: ${allowed.join(", ")}`);
+      }
+      if (new Set(tools).size !== tools.length) {
+        throw new Error("delegate-workers task tools must not contain duplicates");
+      }
+    }
+    const advisorTiers = (tools ?? allowed).includes(ADVISOR_TOOL) ? higherTiers : undefined;
+    const profileConfig = route?.tier === undefined
+      ? { ...config.profiles[profile], ...config.modelSets[modelSet ?? ""]?.profiles?.[profile] }
+      : { model: route.tier.model, thinkingLevel: route.tier.thinkingLevel ?? null };
     const routed: RoutedTask = {
       task: request.task,
       ...(request.timeoutMs === undefined ? {} : { timeoutMs: request.timeoutMs }),
@@ -266,6 +269,7 @@ export function routeTasks(
       ...(modelSet === undefined ? {} : { modelSet }),
       modelSetSource,
       ...profileConfig,
+      ...(advisorTiers === undefined ? {} : { advisorTiers }),
     };
 
     if (typeof routed.model === "string") {
@@ -542,12 +546,14 @@ export async function runTask(
     abortController.signal,
     deadlineController.signal,
   ]);
-  const allowedTools = task.tools ?? getWorkerTools();
+  const allowedTools = task.tools ?? getWorkerTools(!!task.advisorTiers?.length);
   const tools = options.background ? allowedTools.filter((name) => name !== "delegate_tasks") : allowedTools;
+  const advisorTiers = tools.includes(ADVISOR_TOOL) ? task.advisorTiers : undefined;
   const worker = (options.createWorker ?? createRpcWorker)({
     cwd: ctx.cwd,
     tools,
     enforceTools: options.background || task.tools !== undefined,
+    advisorTiers,
     model: task.model,
     thinkingLevel: task.thinkingLevel,
     ui: options.background ? undefined : ctx.ui,
@@ -896,6 +902,11 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
   const inheritedEndpoint = process.env.PI_DELEGATE_COORDINATOR_ENDPOINT;
   const depth = getDepth();
   const maxDepth = getMaxDepth();
+  if (!inheritedEndpoint) registerAdvisor(pi);
+  else if (depth >= 1 && process.env.PI_DELEGATE_WORKER_TOKEN) {
+    const tiers = inheritedAdvisorTiers(process.env[ADVISOR_TIERS_ENV]);
+    if (tiers.length > 0) registerAdvisor(pi, tiers);
+  }
   if (inheritedEndpoint && (depth < 1 || depth >= maxDepth || !process.env.PI_DELEGATE_WORKER_TOKEN)) return;
 
   const workers = new Map<string, WorkerState>();
@@ -1202,6 +1213,7 @@ export default function delegateWorkersExtension(pi: ExtensionAPI) {
       "For delegate_tasks, select profile fast for lookups, searches, summaries, and isolated checks; balanced for multi-file tracing, routine changes, and test diagnosis; deep for architecture, security, migrations, and ambiguous root causes.",
       "For delegate_tasks, leave modelSet out of each task unless the user requests a configured routing override or an independent model family. The tool selects the model set from the active parent model automatically.",
       "Depth-one workers can delegate once by default. Set PI_DELEGATE_MAX_DEPTH=1 to disable nesting; PI_DELEGATE_TOOLS can restrict worker tools.",
+      "Workers with higher advisor tiers get consult_advisor unless an explicit tool allowlist omits it.",
       "Use a task's tools field to restrict worker tools. For read-only tasks, include read, codemode, and tool_search when allowed by the worker allowlist; do not exclude codemode or tool_search just because the task is read-only. Add bash only when command access is needed. Explicit PI_DELEGATE_TOOLS restrictions remain authoritative.",
       "Read-only tasks must not make changes through scripts, shell commands, or discovered tools. Tool selection is not a read-only sandbox; bash permits writes. The default for depth-one workers is read,write,edit,bash,codemode,tool_search,delegate_tasks; depth-two workers cannot delegate.",
     ],

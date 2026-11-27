@@ -3,7 +3,8 @@ import { existsSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Usage } from "@earendil-works/pi-ai";
-import type { ThinkingLevel } from "./config.ts";
+import { ADVISOR_TIERS_ENV } from "./advisor.ts";
+import type { DelegateTierConfig, ThinkingLevel } from "./config.ts";
 import type { RpcUiDialogQueue } from "./ui-dialog-queue.ts";
 
 export type RpcEvent = any;
@@ -253,6 +254,7 @@ export type WorkerRoutingOptions = {
   thinkingLevel?: ThinkingLevel | null;
   enforceTools?: boolean;
   nestedDelegation?: boolean;
+  consultation?: boolean;
 };
 
 function removeOptions(args: string[], names: string[]): string[] {
@@ -276,7 +278,7 @@ export function buildWorkerArgs(
   routing: WorkerRoutingOptions = {},
 ): string[] {
   let extraArgs = splitExtraArgs(process.env.PI_DELEGATE_EXTRA_ARGS);
-  if (routing.enforceTools || routing.nestedDelegation) {
+  if (routing.enforceTools || routing.nestedDelegation || routing.consultation) {
     extraArgs = removeOptions(extraArgs, ["--tools", "-t"]);
   }
   if (routing.model !== undefined) {
@@ -287,7 +289,7 @@ export function buildWorkerArgs(
   }
 
   const args = ["--mode", "rpc", "--no-session", "--tools", tools.join(",")];
-  if (routing.nestedDelegation) args.push("--extension", fileURLToPath(new URL("./index.ts", import.meta.url)));
+  if (routing.nestedDelegation || routing.consultation) args.push("--extension", fileURLToPath(new URL("./index.ts", import.meta.url)));
   const toolGuardExtension = resolveToolGuardExtension();
   if (toolGuardExtension && isEnabled(process.env.PI_DELEGATE_TOOL_GUARD_ISOLATE) && !hasNoExtensionsArg(extraArgs)) {
     args.push("--no-extensions");
@@ -312,6 +314,7 @@ export function createRpcWorker(options: {
   thinkingLevel?: ThinkingLevel | null;
   enforceTools?: boolean;
   coordinatorEndpoint?: string;
+  advisorTiers?: DelegateTierConfig[];
   workerToken?: string;
   workerDepth?: number;
   maxDepth?: number;
@@ -334,6 +337,7 @@ export function createRpcWorker(options: {
       thinkingLevel: options.thinkingLevel,
       enforceTools: options.enforceTools,
       nestedDelegation: options.maxDepth === 2 && options.workerDepth === 1 && options.tools.includes("delegate_tasks"),
+      consultation: !!options.coordinatorEndpoint && !!options.advisorTiers?.length,
     }),
     {
       cwd: options.cwd,
@@ -345,6 +349,7 @@ export function createRpcWorker(options: {
         PI_DELEGATE_PARENT_WORKER_ID: options.uiPrefix,
         PI_DELEGATE_WORKER_DEPTH: String(options.workerDepth),
         PI_DELEGATE_MAX_DEPTH: String(options.maxDepth),
+        [ADVISOR_TIERS_ENV]: options.advisorTiers?.length ? JSON.stringify(options.advisorTiers) : undefined,
       } } : {}),
     }
   );
