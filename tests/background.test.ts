@@ -50,6 +50,7 @@ function runtime(t: TestContext, deny?: string | null, settings = {}) {
     renderResult(result: AgentToolResult<unknown>, options: ToolRenderResultOptions, theme: Theme): Component;
   };
   let statusTool: Pick<typeof tool, "execute">;
+  let waitTool: Pick<typeof tool, "execute">;
   delegateWorkersExtension({
     events,
     getSettings: () => settings,
@@ -58,6 +59,7 @@ function runtime(t: TestContext, deny?: string | null, settings = {}) {
     registerTool: (definition: typeof tool & { name: string }) => {
       if (definition.name === "delegate_tasks") tool = definition;
       if (definition.name === "delegate_status") statusTool = definition;
+      if (definition.name === "delegate_wait") waitTool = definition;
     },
     registerMessageRenderer: (name: string, renderer: MessageRenderer) => renderers.set(name, renderer),
     sendMessage: (message: Omit<(typeof messages)[number], "options">, options: { triggerTurn: boolean }) => messages.push({ ...message, options }),
@@ -76,12 +78,16 @@ function runtime(t: TestContext, deny?: string | null, settings = {}) {
     cwd, messages, notifications, authorizations, stop,
     start: () => handlers.get("session_start")!({ type: "session_start" }, ctx),
     status: (id?: string) => statusTool.execute("status-call", id === undefined ? {} : { id }, undefined, undefined, ctx),
+    wait: (ids?: string[], signal?: AbortSignal) => waitTool.execute("wait-call", ids === undefined ? {} : { ids }, signal, undefined, ctx),
     execute: (params: unknown, signal?: AbortSignal) => tool.execute("test-call", params, signal, undefined, ctx),
     renderToolResult: (result: AgentToolResult<unknown>, expanded: boolean) =>
       tool.renderResult(result, { expanded, isPartial: false }, theme).render(60).map((line) => line.trim()),
     renderMessage: (message: (typeof messages)[number], expanded: boolean) =>
-      renderers.get(message.customType)!({ ...message, role: "custom", timestamp: 0 }, { expanded, outputPad: 1 }, theme)!
-        .render(60).map((line) => line.trim()),
+      renderers.get(message.customType)!(
+        { ...message, role: "custom", timestamp: 0 },
+        { expanded, outputPad: 1, keyText: () => "", keyHint: () => "" },
+        theme,
+      )!.render(60).map((line) => line.trim()),
     cancel: (id: string) => commands.get("cancel-worker")!.handler(id, ctx),
   };
 }
@@ -137,6 +143,112 @@ test("delegate_status lists queued and running jobs and looks up finished jobs b
   assert.deepEqual((await r.status("w3")).details.jobs, [{ id: "w3", label: "printf third", status: "ok" }]);
   await r.start();
   assert.match((await r.status("w3")).content[0].text, /not found/);
+});
+
+test("delegate_wait reports no active jobs and rejects unknown IDs", async (t) => {
+  const r = runtime(t, null);
+  assert.equal((await r.wait()).content[0].text, "No active delegate jobs.");
+  await assert.rejects(r.wait(["w99"]), /w99/);
+  await r.execute({ commands: [{ command: "printf completed-output" }] });
+  assert.equal((await r.wait()).content[0].text, "No active delegate jobs.");
+  await assert.rejects(r.wait(["w1", "w99"]), /w99/);
+});
+
+test("delegate_wait snapshots active jobs and does not wait for jobs started later", async (t) => {
+  const r = runtime(t, null);
+  await r.execute({ mode: "background", commands: [
+    { command: "touch started-first; while [ ! -f release-first ]; do sleep 0.05; done; printf first-output" },
+  ] });
+  await until(() => existsSync(join(r.cwd, "started-first")));
+  let settled = false;
+  const waiting = r.wait().then((result) => { settled = true; return result; });
+  await r.execute({ mode: "background", commands: [
+    { command: "touch started-later; while [ ! -f release-later ]; do sleep 0.05; done; printf later-output" },
+  ] });
+  await until(() => existsSync(join(r.cwd, "started-later")));
+  assert.equal(settled, false);
+  writeFileSync(join(r.cwd, "release-first"), "");
+  await until(() => settled);
+  const result = await waiting;
+  assert.match(result.content[0].text, /first-output/);
+  assert.match(result.content[0].text, /exit_code: 0/);
+  assert.doesNotMatch(result.content[0].text, /later-output/);
+  assert.equal((await r.status("w2")).details.jobs[0]?.status, "running");
+  writeFileSync(join(r.cwd, "release-later"), "");
+  await until(() => r.messages.length === 2);
+});
+
+test("delegate_wait includes background results that finished before the wait", async (t) => {
+  const r = runtime(t, null);
+  const started = await r.execute({ mode: "background", commands: [
+    { command: "printf '%s' early-result" },
+    { command: "while [ ! -f release ]; do sleep 0.05; done; printf '%s' late-result" },
+  ] });
+  await until(() => r.messages.length === 1);
+  const waiting = r.wait();
+  writeFileSync(join(r.cwd, "release"), "");
+  const result = await waiting;
+  assert.deepEqual([...result.details.ids].sort(), started.details.ids);
+  assert.match(result.content[0].text, /\nearly-result(?:\n|$)/);
+  assert.match(result.content[0].text, /\nlate-result(?:\n|$)/);
+  assert.deepEqual((await r.wait()).details.ids, []);
+});
+
+test("delegate_wait waits for explicit running and queued jobs and returns recent completions", async (t) => {
+  const r = runtime(t, null);
+  await r.execute({ mode: "background", commands: [
+    { command: "touch started1; while [ ! -f release ]; do sleep 0.05; done; printf running-output" },
+    { command: "touch started2; while [ ! -f release-unselected ]; do sleep 0.05; done; printf unselected-output" },
+    { command: "printf queued-output; printf queued-error >&2; exit 7" },
+  ] });
+  await until(() => existsSync(join(r.cwd, "started1")) && existsSync(join(r.cwd, "started2")));
+  assert.equal((await r.status("w3")).details.jobs[0]?.status, "queued");
+  let settled = false;
+  const waiting = r.wait(["w1", "w3"]).then((result) => { settled = true; return result; });
+  const allWaiting = r.wait();
+  await delay(30);
+  assert.equal(settled, false);
+  writeFileSync(join(r.cwd, "release"), "");
+  await until(() => settled);
+  const result = await waiting;
+  assert.match(result.content[0].text, /running-output/);
+  assert.match(result.content[0].text, /queued-output/);
+  assert.match(result.content[0].text, /queued-error/);
+  assert.match(result.content[0].text, /exit_code: 0/);
+  assert.match(result.content[0].text, /exit_code: 7/);
+  assert.doesNotMatch(result.content[0].text, /unselected-output/);
+  assert.equal((await r.status("w2")).details.jobs[0]?.status, "running");
+  writeFileSync(join(r.cwd, "release-unselected"), "");
+  const allResults = await allWaiting;
+  assert.match(allResults.content[0].text, /running-output/);
+  assert.match(allResults.content[0].text, /unselected-output/);
+  assert.match(allResults.content[0].text, /queued-output/);
+  await until(() => r.messages.length === 3);
+  const completed = await r.wait(["w3"]);
+  assert.match(completed.content[0].text, /queued-output/);
+  assert.match(completed.content[0].text, /queued-error/);
+  assert.match(completed.content[0].text, /exit_code: 7/);
+  assert.doesNotMatch(completed.content[0].text, /running-output|unselected-output/);
+});
+
+test("aborting delegate_wait rejects the wait without cancelling its background job", async (t) => {
+  const r = runtime(t, null);
+  await r.execute({ mode: "background", commands: [
+    { command: "touch started; while [ ! -f release ]; do sleep 0.05; done; printf survived-wait-abort" },
+  ] });
+  await until(() => existsSync(join(r.cwd, "started")));
+  const controller = new AbortController();
+  const waiting = r.wait(["w1"], controller.signal);
+  const rejected = assert.rejects(waiting);
+  controller.abort();
+  await rejected;
+  assert.equal((await r.status("w1")).details.jobs[0]?.status, "running");
+  assert.equal(r.messages.length, 0);
+  writeFileSync(join(r.cwd, "release"), "");
+  await until(() => r.messages.length === 1);
+  assert.equal(r.messages[0]?.details.status, "ok");
+  assert.match(r.messages[0]!.content, /survived-wait-abort/);
+  assert.match((await r.wait(["w1"])).content[0].text, /survived-wait-abort/);
 });
 
 test("delegate_status retains no more than 50 finished jobs", async (t) => {

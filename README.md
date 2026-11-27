@@ -7,7 +7,7 @@ The agent decides what to delegate from normal prompts. Work that needs reasonin
 ## What it does
 
 - `delegate_tasks` with parent-agent-selected `fast`, `balanced`, or `deep` profiles
-- background jobs return IDs immediately after authorization and report results separately as they finish
+- background jobs return IDs immediately after authorization and report results separately as they finish; `delegate_wait` collects their results when needed
 - direct Bash and PowerShell commands authorized by `pi-tool-guard`
 - `/cancel-worker 13` to cancel the queued or running job shown as `w13` in the live widget (the `w13` form is also accepted)
 - optional deadlines starting when a job launches; jobs have no timeout by default
@@ -195,7 +195,13 @@ The same model and thinking level are used for investigation and the worker's sy
 
 The main agent can call `delegate_status` with `{}` to list active jobs or with `{ "id": "w3" }` to look up one job. The tool returns a snapshot immediately; it does not wait for workers. It covers direct agent and shell jobs, not nested workers. The snapshot includes the job ID, state, a short label, and progress or the worker tool name when available. `cancelling` means a cancellation was requested but the job has not stopped yet.
 
-Lookup by ID also covers the last 50 finished jobs in the current session. Session switches and reloads clear this history. A missing ID does not imply the job is still running. Use the job result for full output.
+Lookup by ID also covers the last 50 finished jobs in the current session. Session switches and reloads clear this history. A missing ID does not imply the job is still running.
+
+### Wait for job results
+
+Use `delegate_wait` after doing work in parallel with background jobs. Call it with `{}` to wait for all direct jobs that are queued or running at the time of the call. This also returns recent background results that `delegate_wait` has not yet returned, so jobs that finished early are not missed. Jobs submitted later are not included.
+
+Use `{ "ids": ["w1", "w3"] }` to wait for only those jobs, including jobs that already finished. An unknown ID is an error. Finished results are available for the last 50 jobs in the session. The tool returns full results, including failures, cancellations, and timeouts. Cancelling the wait does not cancel the jobs.
 
 ## Environment settings
 

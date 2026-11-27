@@ -143,3 +143,17 @@ test("delegate_tasks accepts structured tasks without a legacy string adapter", 
   assert.equal(Check(tool.parameters, { tasks: [{ task: "inspect" }] }), true);
   assert.equal(Check(tool.parameters, { tasks: ["inspect"] }), false);
 });
+
+test("delegate_tasks validates optional string enums", () => {
+  const { parameters } = registeredTool();
+  const { tasks, commands, mode } = parameters.properties;
+  for (const schema of [tasks.items.properties.profile, commands.items.properties.shell, mode]) {
+    assert.equal(schema.type, "string");
+    assert.ok(Array.isArray(schema.enum));
+  }
+  assert.equal(Check(parameters, { tasks: [{ task: "inspect", profile: "fast" }], mode: "background" }), true);
+  assert.equal(Check(parameters, { commands: [{ command: ":", shell: "bash" }] }), true);
+  assert.equal(Check(parameters, { tasks: [{ task: "inspect", profile: "unknown" }] }), false);
+  assert.equal(Check(parameters, { commands: [{ command: ":", shell: "unknown" }] }), false);
+  assert.equal(Check(parameters, { tasks: [{ task: "inspect" }], mode: "unknown" }), false);
+});
